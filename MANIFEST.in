@@ -1,0 +1,6 @@
+include LICENSE README.md config.example.json
+include install.sh uninstall.sh hint hint.service rtc_helper.py
+recursive-include completions *.bash
+recursive-include tests *.py
+include .github/workflows/test.yml
+recursive-include docs *.md

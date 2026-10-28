@@ -1,0 +1,13 @@
+[Unit]
+Description=HINT Human Interrupt
+# HINT managed user service; install.sh fills in this command's absolute path.
+
+[Service]
+Type=simple
+WorkingDirectory=%h
+ExecStart=%h/.local/share/hint/venv/bin/hint --serve
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

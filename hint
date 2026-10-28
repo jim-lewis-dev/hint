@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+case "${XDG_DATA_HOME:-}" in
+  /*) HINT_DATA_HOME="$XDG_DATA_HOME" ;;
+  *) HINT_DATA_HOME="$HOME/.local/share" ;;
+esac
+HINT_COMMAND="$HINT_DATA_HOME/hint/venv/bin/hint"
+if [[ ! -x "$HINT_COMMAND" ]]; then
+  printf 'HINT is not installed. Run ./install.sh first.\n' >&2
+  exit 1
+fi
+exec "$HINT_COMMAND" "$@"

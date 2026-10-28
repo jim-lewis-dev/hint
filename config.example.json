@@ -1,0 +1,6 @@
+{
+  "nats_server": "nats://127.0.0.1:4222",
+  "wake_lead_seconds": 10,
+  "request_timeout_seconds": 10,
+  "discovery_timeout_seconds": 1.0
+}

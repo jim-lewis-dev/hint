@@ -1,0 +1,27 @@
+name: Tests
+on:
+  push:
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.10', '3.12', '3.14']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: sudo apt-get update && sudo apt-get install -y nats-server
+      - run: python -m pip install .
+      - run: python -m unittest discover -s tests -v
+        env:
+          REQUIRE_NATS_SERVER: '1'
+      - run: python -m pip wheel --no-deps --wheel-dir dist .
+      - name: Verify installed messaging dependencies outside checkout
+        working-directory: ${{ runner.temp }}
+        run: |
+          python -m pip check
+          python -c 'import agent_messenger, nats_transport; print(agent_messenger.__file__); print(nats_transport.__file__)'
