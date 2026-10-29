@@ -4,14 +4,19 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "human-interrupt"
-version = "0.1.5"
+version = "0.1.6"
 description = "Named local and remote desktop signals with optional scheduling and wakeup"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{name = "Jim Lewis"}]
-dependencies = ["agent-messenger @ git+https://github.com/jim-lewis-dev/agent_messenger.git@ec34a8cb25623a6b7675830d739fa82c4dcbf157"]
+dependencies = ["agent-messenger @ git+https://github.com/jim-lewis-dev/agent_messenger.git@fdfa9d9ce4c0bd3a6fcfee7177b1fec0b2359e8e"]
+
+[project.urls]
+Homepage = "https://github.com/jim-lewis-dev/hint"
+Repository = "https://github.com/jim-lewis-dev/hint"
+Issues = "https://github.com/jim-lewis-dev/hint/issues"
 
 [project.scripts]
 hint = "hint:main"

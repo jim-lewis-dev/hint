@@ -15,15 +15,20 @@ There is no JetStream or offline queue.
 Supported: Ubuntu 22.04 or newer, Python 3.10 or newer, Bash, and a systemd
 user session.
 
-Copy or unpack the HINT source folder to `~/projects/hint` on the new computer.
-The folder must contain `install.sh`, `pyproject.toml`, and the Python source
-files. A local source copy is sufficient; HINT does not need to be in a Git
-repository. Open a terminal in your desktop session and run as your normal user:
+Open a terminal in your desktop session and run as your normal user:
 
 ```bash
+sudo apt-get install -y git
+mkdir -p "$HOME/projects"
+git clone https://github.com/jim-lewis-dev/hint.git "$HOME/projects/hint"
 cd "$HOME/projects/hint"
 ./install.sh --server nats://192.168.1.10:4222
 ```
+
+Clone once on each new computer. If you already have a checkout, use the
+[update instructions](#update-an-installed-computer) instead. You can also
+unpack a source archive into `~/projects/hint` and run the same installer;
+HINT does not require Git history to run.
 
 Replace the example server URL with your NATS broker's address. Repeat on each
 computer, using the **same reachable broker**. `127.0.0.1` means the computer
@@ -71,10 +76,11 @@ the computer's firmware and Linux support; test it on each target computer.
 
 ## Update an installed computer
 
-Get the current HINT source on **each computer** you want to update, then run:
+For a Git checkout, run on **each computer** you want to update:
 
 ```bash
 cd "$HOME/projects/hint"
+git pull --ff-only
 ./install.sh
 ```
 
@@ -82,9 +88,8 @@ The installer updates the installed application and restarts the service while
 preserving that computer's settings and signals. It also refreshes completion
 and any existing wake support. Open a new terminal afterward.
 
-Use the same source-distribution method you used for installation: replace the
-source folder with the current copy, or, once HINT is published and you have
-cloned that repository, run `git pull --ff-only` before `./install.sh`.
+If you installed from an archive, replace the source with the current copy
+and run `./install.sh` from that folder instead of using `git pull`.
 Publishing a change with `git push` does not update installed computers.
 Keep communicating computers on the same HINT version. On an existing
 installation, omit `--server` and `--local`; to change the broker, edit the [configuration](#configuration-and-files)
@@ -357,7 +362,7 @@ network tests skip unless `REQUIRE_NATS_SERVER=1` is set. Real display/audio,
 suspend, and firmware wake support still need a test on the target computer.
 
 HINT depends on [Agent Messenger](https://github.com/jim-lewis-dev/agent_messenger),
-pinned to tested commit `ec34a8cb25623a6b7675830d739fa82c4dcbf157`. Messenger
+pinned to tested commit `fdfa9d9ce4c0bd3a6fcfee7177b1fec0b2359e8e`. Messenger
 installs its pinned NATS transport dependency, which installs `nats-py`. HINT
 contains no copies of either library. Installation requires Git and access to
 GitHub. Dependency upgrades are explicit changes followed by HINT's
