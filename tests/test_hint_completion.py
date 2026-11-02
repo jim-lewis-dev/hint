@@ -45,7 +45,7 @@ class CompletionTests(unittest.TestCase):
             self.assertEqual(self.candidates("hint", "--set", "new_signal"), [])
 
     def test_options_only_offer_modifiers_for_set(self):
-        self.assertEqual(self.candidates("hint", "--r"), ["--remove", "--remote"])
+        self.assertEqual(self.candidates("hint", "--r"), ["--resume", "--remove", "--ready", "--remote"])
         self.assertEqual(self.candidates("hint", "--set", "new_name", "--a"), ["--action"])
         self.assertEqual(self.candidates("hint", "--set", "new_name", "--h"), ["--help"])
         self.assertNotIn("--handler", self.candidates("hint", "--set", "new_name", ""))
@@ -58,37 +58,104 @@ class CompletionTests(unittest.TestCase):
 
     def test_remote_discovery_and_remote_names(self):
         before = self.table.read_bytes()
-        with patch.object(network, "discover", return_value=["hint_server_alder", "hint_server_birch"]):
-            self.assertEqual(self.candidates("hint", "--remote", "hint_server_b"), ["hint_server_birch"])
+        with patch.object(network, "discover", return_value=["alder", "birch"]):
+            self.assertEqual(self.candidates("hint", "--remote", "b"), ["birch"])
         with patch.object(network, "remote", return_value={"remote_alarm": {"action": "unused"}}) as request:
-            self.assertEqual(self.candidates("hint", "--remote", "hint_server_birch", "--get", "r"), ["remote_alarm"])
-            request.assert_called_once_with("hint_server_birch", ["--list"])
+            self.assertEqual(self.candidates("hint", "--remote", "birch", "--get", "r"), ["remote_alarm"])
+            request.assert_called_once_with("birch", ["--list"], timeout=completion.COMPLETION_TIMEOUT)
         self.assertEqual(self.table.read_bytes(), before)
 
     def test_remote_after_cursor_still_selects_remote_names(self):
         with patch.object(network, "remote", return_value={"remote_alarm": {"action": "unused"}}) as request:
-            words = ["hint", "--get", "r", "--remote=hint_server_birch"]
+            words = ["hint", "--get", "r", "--remote=birch"]
             self.assertEqual(completion.complete(words, 2), ["remote_alarm"])
-            request.assert_called_once_with("hint_server_birch", ["--list"])
+            request.assert_called_once_with("birch", ["--list"], timeout=completion.COMPLETION_TIMEOUT)
 
     def test_action_values_are_not_mistaken_for_remote_options(self):
         with patch.object(network, "remote", side_effect=AssertionError("network used")):
-            words = ["hint", "--set", "br", "--action", "--remote=hint_server_other"]
+            words = ["hint", "--set", "br", "--action", "--remote=other"]
             self.assertEqual(completion.complete(words, 2), ["breakfast"])
 
     def test_discovery_and_remote_are_not_combined(self):
         self.assertNotIn("--remote", self.candidates("hint", "--discover", ""))
-        self.assertNotIn("--discover", self.candidates("hint", "--remote", "hint_server_birch", ""))
+        self.assertNotIn("--discover", self.candidates("hint", "--remote", "birch", ""))
 
     def test_attached_values_and_bash_equals_wordbreaks(self):
         self.assertEqual(self.candidates("hint", "--get=st"), ["--get=stretch"])
         self.assertEqual(self.candidates("hint", "--get", "=", "st"), ["stretch"])
         self.assertEqual(self.candidates("hint", "--get", "="), ["bedtime", "breakfast", "stretch"])
-        with patch.object(network, "discover", return_value=["hint_server_birch"]):
-            self.assertEqual(self.candidates("hint", "--remote", "=", "hint_server_b"), ["hint_server_birch"])
+        with patch.object(network, "discover", return_value=["birch"]):
+            self.assertEqual(self.candidates("hint", "--remote", "=", "b"), ["birch"])
         with patch.object(network, "remote", return_value={"remote_alarm": {"action": "unused"}}):
-            words = ["hint", "--get", "=", "r", "--remote", "=", "hint_server_birch"]
+            words = ["hint", "--get", "=", "r", "--remote", "=", "birch"]
             self.assertEqual(completion.complete(words, 3), ["remote_alarm"])
+
+    def test_incomplete_or_failed_remote_never_uses_local_names(self):
+        for tail in (["--remote"], ["--remote", ""], ["--remote="], ["--remote", "=", ""]):
+            with self.subTest(tail=tail):
+                self.assertEqual(completion.complete(["hint", "--fire", "st", *tail], 2), [])
+        with patch.object(network, "remote", side_effect=RuntimeError("offline")):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                completion.main(["2", "hint", "--fire", "st", "--remote", "missing"])
+            self.assertEqual(output.getvalue(), "")
+
+    def test_local_and_remote_changes_appear_on_next_tab(self):
+        self.assertEqual(self.candidates("hint", "--get", "st"), ["stretch"])
+        self.table.write_text('{"fresh":{"action":"/bin/true"}}')
+        self.assertEqual(self.candidates("hint", "--get", "st"), [])
+        self.assertEqual(self.candidates("hint", "--get", "fr"), ["fresh"])
+        with patch.object(network, "remote", side_effect=[{"old": {}}, {"new": {}}, {}]) as remote:
+            self.assertEqual(self.candidates("hint", "--remote", "birch", "--get", ""), ["old"])
+            self.assertEqual(self.candidates("hint", "--remote", "birch", "--get", ""), ["new"])
+            self.assertEqual(self.candidates("hint", "--remote", "birch", "--get", ""), [])
+            self.assertEqual(remote.call_count, 3)
+
+    def test_controls_include_live_runs_without_saved_definitions(self):
+        status = {"definitions": {"stretch": {}}, "runs": [
+            {"name": "removed_definition", "active": True},
+            {"name": "HINT-001", "active": True},
+            {"name": "finished", "active": False}
+        ]}
+        with patch("hint_runtime.request", return_value=status) as request:
+            for operation in ("--pause", "--resume", "--stop"):
+                self.assertEqual(self.candidates("hint", operation, ""), ["HINT-001", "removed_definition"])
+            self.assertEqual(self.candidates("hint", "--status", ""),
+                             ["HINT-001", "finished", "removed_definition", "stretch", "--remote"])
+            self.assertTrue(all(call.kwargs["timeout"] == completion.COMPLETION_TIMEOUT
+                                for call in request.call_args_list))
+        with patch.object(network, "remote", return_value=status) as request:
+            self.assertEqual(self.candidates("hint", "--remote", "birch", "--stop", "HINT-"), ["HINT-001"])
+            request.assert_called_once_with("birch", ["--status"], timeout=completion.COMPLETION_TIMEOUT)
+
+    def test_status_still_completes_saved_names_when_service_is_stopped(self):
+        with patch("hint_runtime.request", side_effect=hint_config.HintError("HINT service is not running. Run hint --ready.")):
+            self.assertEqual(self.candidates("hint", "--status", "st"), ["stretch"])
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                completion.main(["2", "hint", "--stop", "st"])
+            self.assertEqual(output.getvalue(), "")
+
+    def test_optional_values_offer_switches_only_as_separate_arguments(self):
+        self.assertEqual(self.candidates("hint", "--fire", ""),
+                         ["bedtime", "breakfast", "stretch", "--action"])
+        self.assertNotIn("--fire=--action", self.candidates("hint", "--fire="))
+        with patch("hint_runtime.request", return_value={"definitions": {"stretch": {}}, "runs": []}):
+            self.assertEqual(self.candidates("hint", "--status", ""), ["stretch", "--remote"])
+            self.assertEqual(self.candidates("hint", "--status="), ["--status=stretch"])
+        with patch.object(network, "remote", return_value={"definitions": {"stretch": {}}, "runs": []}):
+            self.assertEqual(self.candidates("hint", "--remote", "birch", "--status", ""), ["stretch"])
+
+    def test_new_modifiers_nameless_fire_and_ready_context(self):
+        self.assertIn("--action", self.candidates("hint", "--fire", "--a"))
+        self.assertIn("--action", self.candidates("hint", "--fire", ""))
+        self.assertNotIn("--action", self.candidates("hint", "--fire", "stretch", ""))
+        self.assertNotIn("--time", self.candidates("hint", "--set", "stretch", "--no-time", ""))
+        self.assertNotIn("--wake", self.candidates("hint", "--set", "stretch", "--no-wake", ""))
+        self.assertNotIn("--no-wake", self.candidates("hint", "--set", "stretch", "--wake", ""))
+        self.assertNotIn("--remote", self.candidates("hint", "--ready", ""))
+        self.assertIn("--server", self.candidates("hint", "--ready", ""))
+        self.assertNotIn("--ready", self.candidates("hint", "--remote", "birch", ""))
 
     def test_missing_or_broken_data_and_offline_errors_are_quiet(self):
         output, errors = io.StringIO(), io.StringIO()

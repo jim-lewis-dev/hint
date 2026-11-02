@@ -1,371 +1,398 @@
 # HINT — Human INTerrupt
 
-HINT gives a name to an action: play a sound, show a picture or slideshow,
-open a page, or start a command. Fire it immediately or schedule it once.
-Computers connected to the same NATS broker can discover each other and set,
-read, fire, or remove each other's signals.
+**An alarm clock with unreasonable ambition.**
 
-Each computer owns its own signals. Messaging uses live Core NATS through
-[Agent Messenger](https://github.com/jim-lewis-dev/agent_messenger) and its
-[NATS transport](https://github.com/jim-lewis-dev/nats_transport) dependency.
-There is no JetStream or offline queue.
+Launch reminders, media, messages, and commands—locally, remotely, or on a
+schedule.
 
-## Install on each computer
+```bash
+hint --fire --action 'popup:Dinner is ready!' --remote beacon
+```
 
-Supported: Ubuntu 22.04 or newer, Python 3.10 or newer, Bash, and a systemd
-user session.
+HINT can play a song, fill a screen with a message, loop a folder of media,
+open a web page, or run a shell command. Save useful actions under names,
+schedule them, and pause, resume, or stop what you launched.
 
-Open a terminal in your desktop session and run as your normal user:
+Each computer owns its definitions and runs. Remote communication uses live
+Core NATS through [Agent Messenger](https://github.com/jim-lewis-dev/agent_messenger)
+and [NATS transport](https://github.com/jim-lewis-dev/nats_transport). There is
+no JetStream or offline message queue. Local use needs no NATS broker.
+
+## Install once on each computer
+
+HINT targets Ubuntu 22.04 or newer, Python 3.10 or newer, Bash, and a systemd
+user session. Open a terminal in your desktop and run as your normal user:
 
 ```bash
 sudo apt-get install -y git
 mkdir -p "$HOME/projects"
 git clone https://github.com/jim-lewis-dev/hint.git "$HOME/projects/hint"
 cd "$HOME/projects/hint"
-./install.sh --server nats://192.168.1.10:4222
+./hint --ready
 ```
 
-Clone once on each new computer. If you already have a checkout, use the
-[update instructions](#update-an-installed-computer) instead. You can also
-unpack a source archive into `~/projects/hint` and run the same installer;
-HINT does not require Git history to run.
-
-Replace the example server URL with your NATS broker's address. Repeat on each
-computer, using the **same reachable broker**. `127.0.0.1` means the computer
-running the command, so it cannot identify another computer's broker.
-
-The installer installs HINT, MPV, desktop-opening tools, Bash completion, Git,
-and a background user service. Agent Messenger, NATS transport, and the NATS
-Python client install automatically as dependencies. Internet access is needed
-to download packages and the dependencies hosted on GitHub. The **NATS broker
-is separate**; use one already running on your network or configure one before testing remote
-operations. You do not need a broker on every computer.
-
-The installer requests sudo for system packages. Do not run the entire script
-with sudo. Once installed, HINT starts automatically when you log in and stays
-available for schedules and remote requests. It resumes with your session after
-suspend. Desktop actions require a logged-in desktop session; startup before
-login is not promised.
-
-Open a new terminal for the `hint` command and completion. If `hint` is not
-found, ensure `~/.local/bin` is on your PATH. Verify installation with:
+The first setup asks for a NATS server URL or local-only operation. You can
+supply the choice directly:
 
 ```bash
-hint --list
-systemctl --user status hint.service --no-pager
-hint --discover
+./hint --ready --server nats://server:4222
 ```
 
-Running `./install.sh` without options asks for a broker address on the first
-interactive installation. For a local-only computer, replace the installation
-command with:
+Replace `server` with your broker's hostname or IP address. Use the same
+reachable broker on participating computers. `127.0.0.1` always means the
+computer running HINT; it does not identify a broker on another computer.
+For a computer that needs no remote communication, use `./hint --ready --local`.
+
+Setup installs HINT and its Python dependencies, MPV, desktop-opening tools,
+GTK, Bash completion, and a background user service. System package
+installation may request sudo; do not run the whole command with sudo.
+The NATS broker itself is separate: use an existing broker or configure one
+before testing remote operations. You need one reachable broker, not a broker
+on every computer.
+
+HINT starts immediately and automatically with your user session on later
+logins. After suspend, it continues with that session. Displaying windows
+requires a usable desktop session; booting to a login screen is not sufficient.
+
+Open a new terminal, then try:
 
 ```bash
-./install.sh --local
+hint --status
+hint --fire --action 'popup:HINT is ready.'
 ```
 
-For optional hardware wake support, add `--enable-wake` to the first installation
-command, or run this later from the project directory:
+Dismiss the popup with its button or Escape. If `hint` is not found, ensure
+`~/.local/bin` is on your PATH. The project-local `./hint` launcher also works.
+
+## Ready, set, fire
 
 ```bash
-./install.sh --enable-wake
+hint --set stretch --action 'popup:Get up and stretch.'
+hint --fire stretch
+hint --status stretch
+hint --stop stretch
 ```
 
-Wake support installs a restricted privileged RTC helper. It still depends on
-the computer's firmware and Linux support; test it on each target computer.
+`--set` saves a definition; it does not launch it. `--fire` launches immediately
+and returns without taking over your terminal. Firing the same name again
+starts another run. A fire acknowledgement means **launched**, not successfully
+finished; use status for its progress or outcome.
 
-## Update an installed computer
-
-For a Git checkout, run on **each computer** you want to update:
+Schedule the same action a minute from now:
 
 ```bash
-cd "$HOME/projects/hint"
-git pull --ff-only
-./install.sh
+hint --set stretch --time "$(date -d '+1 minute' '+%Y-%m-%d %H:%M:%S')"
 ```
 
-The installer updates the installed application and restarts the service while
-preserving that computer's settings and signals. It also refreshes completion
-and any existing wake support. Open a new terminal afterward.
-
-If you installed from an archive, replace the source with the current copy
-and run `./install.sh` from that folder instead of using `git pull`.
-Publishing a change with `git push` does not update installed computers.
-Keep communicating computers on the same HINT version. On an existing
-installation, omit `--server` and `--local`; to change the broker, edit the [configuration](#configuration-and-files)
-and restart the service.
-
-## First useful test
+After its scheduled launch, the definition remains and its schedule is cleared.
+Set another time to schedule it again. Existing attributes stay unchanged when
+you omit them:
 
 ```bash
-hint --set example --action https://example.com
-hint --get example
-hint --fire example
-hint --remove example
+hint --set stretch --action 'popup:Walk around for five minutes.'
+hint --set stretch --no-time
+hint --set stretch --no-wake
 ```
 
-The set command saves the named signal; the fire command opens your browser
-and returns JSON promptly. It does not borrow terminal input or wait for the
-browser to close. `--get example` shows the stored action:
+`--no-time` removes the schedule. `--no-wake` disables hardware waking without
+removing the schedule. Neither command stops an active run.
 
-```json
-{
-  "example": {
-    "action": "https://example.com"
-  }
-}
+## Everyday commands
+
+| Command | Purpose |
+| --- | --- |
+| `hint --ready` | Install or update HINT and ensure its service is running |
+| `hint --set NAME --action STRING` | Create an action or change an existing action string |
+| `hint --set NAME --time TIME` | Add or change an existing action's schedule |
+| `hint --set NAME --no-time` | Clear its schedule |
+| `hint --set NAME --wake` / `--no-wake` | Enable or disable its wake preference |
+| `hint --get NAME` | Show one saved definition |
+| `hint --list` | Show all saved definitions |
+| `hint --fire NAME` | Launch another run of a saved action |
+| `hint --fire --action STRING` | Launch an action without saving a definition |
+| `hint --pause NAME` / `--resume NAME` | Pause or resume the active runs that support it |
+| `hint --stop NAME` | Stop the active runs HINT can control |
+| `hint --status [NAME]` | Show service, schedule, and run information |
+| `hint --remove NAME` | Remove a saved definition and its schedule |
+| `hint --discover` | List responding HINT hostnames |
+
+Names use letters, digits, `_`, and `-`, and are case-sensitive. Spell options
+in full. Names of the form `HINT-` followed by digits, ignoring case, are reserved for
+temporary runs. Creating a new definition requires `--action`; modifying an existing one
+requires only the attributes you want to change. Conflicting switches such as
+`--time ... --no-time` are rejected.
+
+Pause, resume, and stop by a saved name apply to **all its active runs**.
+Removing a definition does not stop those runs; they remain visible in status
+and selectable for control. Stopping a run does not remove its definition or
+cancel a future schedule.
+
+Nameless fires receive temporary names such as `HINT-001`, then `HINT-002`.
+Use the name printed by the fire response to control that run:
+
+```bash
+hint --status HINT-001
+hint --stop HINT-001
 ```
 
-## Commands
+Temporary names are not saved definitions. Numbers are not recycled during a
+service session, but numbering restarts with the service. Always use current
+status rather than an old remembered temporary name after a restart.
 
-```text
-hint --list
-hint --get NAME
-hint --fire NAME
-hint --set NAME --action STRING [--time "YYYY-MM-DD HH:MM:SS"] [--wake]
-hint --remove NAME
-hint --discover
-hint --remote SERVER <operation>
-```
-
-Names contain letters, digits, `_`, and `-`. Options must be spelled in full.
-Responses are JSON. Exit status is 0 for a completed operation, 1 for an
-operation failure, and 2 for invalid input/configuration or a reported HINT
-error. `--get` returns `{ "NAME": null }` for a missing name; removing a missing
-name returns `"removed": false` without failing.
-
-`--set` replaces the entire definition. Manual `--fire` keeps its definition and
-scheduled time. `"fired": true` means an action process started, not that it
-finished successfully. A timed signal is removed after its action starts.
-Removing a definition does not stop an already running action.
+The terminal shows readable results, tables, and errors. Messages between HINT
+computers remain JSON. Completion is quiet when no candidates are available.
 
 ## Remote use
 
-Each service is named `hint_server_<hostname>`. Characters outside letters,
-digits, `_`, and `-` become underscores. Give participating computers distinct
-hostnames, and run one HINT service per hostname on a shared broker.
+Give computers distinct hostnames and run one HINT service per hostname on a
+shared broker. Use the hostname in commands and completion:
 
 ```bash
 hint --discover
-hint --remote hint_server_beacon --list
-hint --remote hint_server_beacon --set example --action https://example.com
-hint --remote hint_server_beacon --get example
-hint --remote hint_server_beacon --fire example
-hint --remote hint_server_beacon --remove example
+hint --list --remote beacon
+hint --set stretch --action 'popup:Take a break.' --remote beacon
+hint --fire stretch --remote beacon
+hint --status stretch --remote beacon
+hint --stop stretch --remote beacon
+hint --fire --action 'popup:Dinner is ready!' --remote beacon
 ```
 
-Every installed computer can both send and receive. The recipient must be awake,
-connected to the broker, and running its service. Paths and times refer to the
-**receiving computer**. Quote a path such as `'~/Sounds/ding.wav'` so its `~` is
-expanded there. `$HOME` in double quotes is expanded by the sender's shell.
+Replace `beacon` with a hostname returned by discovery. Every installed computer
+can send and receive. The receiver must be awake, connected, and running HINT.
+You can type a known hostname directly even if discovery did not list it.
+`--ready` prepares the local computer; it does not remotely upgrade peers.
 
-`--discover` lists peers that respond during the collection window, one second
-by default. It is a live poll, not a complete inventory: busy, reconnecting, or
-slow computers can miss the deadline. Run it again if a peer is missing, or
-increase `discovery_timeout_seconds` for a slower network. Late responses are
-not retained. Remote-name completion performs the same fresh poll; it does not
-register peers or remember earlier results.
+Paths, command execution, and scheduled times belong to the **receiving
+computer**. For example, `'~/Music/a song.mp3'` refers to its user's music
+folder. Single quotes keep your local shell from expanding the action first.
+All managed actions, including local ones, run from the receiving user's home
+directory. Use absolute paths or explicit `cd` commands when another working
+directory is needed.
 
-A timeout does not prove that a remote action did not execute. Check its state
-before repeating a mutation. HINT does not automatically retry those requests.
-Messages sent while a computer is offline or asleep are not saved for later.
+Discovery is a bounded live poll, not an inventory. A busy, reconnecting, or
+unreachable computer may not answer in time. Messages sent while a receiver
+is offline or asleep are not stored. A remote timeout may occur after an action
+has already launched; check status before repeating it. HINT does not blindly
+retry mutating requests.
 
-Remote commands execute as the receiving desktop user. Allow broker access
-only to trusted users/computers; use NATS authentication and network controls.
-For a shared LAN broker, configure its listening address and authentication,
-allow its client port (normally 4222), and use the matching URL on each HINT
-computer. A URL can include NATS credentials, for example
-`nats://USER:PASSWORD@HOST:4222`; percent-encode reserved characters in credentials.
-A `tls://HOST:PORT` URL uses the client's normal TLS trust configuration.
-Do not put real credentials into the repository.
+Remote commands run as the receiving desktop user. Use a broker accessible only
+to trusted users and computers, with appropriate NATS authentication and network
+controls. Configure broker listening, authentication, and the client port
+(normally 4222) separately. Credentials belong in the private configuration,
+not in the repository. A NATS URL can contain percent-encoded credentials;
+`tls://HOST:PORT` uses the client's TLS trust configuration.
+
+## Actions and controls
+
+| Action | What happens | Pause/resume |
+| --- | --- | --- |
+| `popup:Your message` | HINT opens its own fullscreen text window | Not applicable |
+| Audio file | MPV plays once, without a video window | Supported |
+| Video file | MPV plays once fullscreen | Supported |
+| Image file | MPV shows it fullscreen until closed | Pauses animations; static images remain displayed |
+| Directory | MPV loops all immediate files in filename order; images last eight seconds | Supported |
+| HTTP(S) URL | Open an isolated HINT browser instance and request fullscreen | Not supported |
+| PDF, text, or office document | Open a separate viewer where supported; request fullscreen where available | Not supported |
+| Executable file | Run the file directly | Suspend/continue its owned processes |
+| Shell command | Run through noninteractive `/bin/sh` | Suspend/continue its owned processes |
+
+The `popup:` prefix is case-insensitive; its message is literal text. `POPUP:`
+and `Popup:` work too. Popup text is not HTML or a shell command.
+
+Directory playback remains deliberately broad: every immediate regular file,
+including hidden and non-media files, is passed to MPV. It is nonrecursive and
+uses lexical filename order (`10` before `2`). MPV determines what it can play;
+unsupported entries can report errors or be skipped. Names such as `01`, `02`,
+and `03` make the order obvious. A directory containing only subdirectories
+has no files to submit and is rejected.
+
+HINT requests fullscreen where the application supports it and continues
+quietly otherwise. Its browser uses separate profile data, so your personal
+browser's logins and cookies are not automatically present. HINT controls its
+own instances; it does not kill unrelated browser or document windows.
+URLs and PDFs require an available Firefox or Chromium-family browser. Text
+files use HINT's own read-only viewer; supported office documents use an
+isolated LibreOffice profile in read-only mode when LibreOffice is available.
+Some other desktop associations hand off to an existing application. Those launches
+are explicitly untracked rather than pretending HINT can safely control them.
+
+X11 and Wayland desktops are supported through the chosen applications.
+HINT's own GTK text windows support both display protocols.
+Desktop integration, installed viewers, and graphics/audio drivers vary;
+verify the [practical checks](docs/actions.md) on each target computer.
+
+For a command with redirects or arguments, quote the whole action once:
+
+```bash
+hint --set task --action 'printf "%s\n" booyah > hint-example.txt'
+hint --fire task
+```
+
+This creates `hint-example.txt` in the receiving user's home directory.
+`>` replaces existing contents; `>>` appends. Double quotes inside the outer
+single quotes can protect paths while allowing expansion when the action runs.
+Commands do not load `.bashrc` or interactive aliases and receive empty stdin.
+For complex work, use an executable script. See [actions and practical checks](docs/actions.md)
+for routing order, executable permissions, process control, and examples.
+
+## Scheduling and optional wake
+
+A year is required. Missing month/day values become January/the first; missing
+hour, minute, and second values become zero:
+
+| Input | Meaning |
+| --- | --- |
+| `2027` | `2027-01-01 00:00:00` |
+| `2027-02` | `2027-02-01 00:00:00` |
+| `2027-02-10 09` | `2027-02-10 09:00:00` |
+| `2027-02-10 09:30` | `2027-02-10 09:30:00` |
+
+Times use the receiving computer's local timezone. Invalid dates, times in the
+past, and ambiguous or nonexistent local times at daylight-saving changes are
+rejected. Scheduling output shows the resolved time and timezone.
+
+Schedules are one-shot. Overdue actions are considered when the service next
+runs or resumes. A launch failure keeps the schedule for retry. Once launch
+succeeds, HINT clears the schedule and retains the definition. If saving that
+change fails, the running service suppresses another launch while retrying the
+save. This is not an exactly-once guarantee across a crash or power loss.
+Manual firing leaves a future schedule intact.
+
+To enable optional RTC wake support, run from the project directory:
+
+```bash
+./hint --ready --enable-wake
+```
+
+Then set a time and wake preference:
+
+```bash
+hint --set stretch --time "$(date -d '+5 minutes' '+%Y-%m-%d %H:%M:%S')" --wake
+```
+
+HINT arms the earliest scheduled wake, normally ten seconds early. The computer
+must support RTC waking from the selected sleep state. Waking from shutdown is
+hardware/firmware-dependent and does not create a logged-in desktop session.
+HINT does not suspend the computer or send Wake-on-LAN packets. Test waking on
+each computer separately. Clearing a schedule retains its wake preference for
+a later schedule but leaves no alarm for that unscheduled action.
+
+## Keep each installation current
+
+```bash
+hint --ready
+```
+
+The command updates a clean Git checkout by fast-forward, prepares the new
+installation, and activates it when there are no active runs. It preserves
+settings and definitions. It does not overwrite local source edits or resolve
+divergent Git history. If active runs prevent an update, finish or stop them
+and run it again.
+
+The new environment is prepared before stopping the working service. Activation
+is checked, and failed activation attempts restore the previous installation.
+HINT installs the dependency versions declared by the tested application
+revision, including its tested NATS Python client version. It does not upgrade
+the operating system or shared NATS server. Run `--ready` on each computer;
+pushing to GitHub does not update other installations automatically.
+
+Keep the source checkout available: installation remembers its location. If it
+moves, run `./hint --ready` from the new location. For a source archive without
+Git history, replace it with current source and run `./hint --ready` there.
+An older peer may require updating before it supports a newly added operation.
 
 ## Configuration and files
 
 | File | Purpose |
 | --- | --- |
-| `~/.config/hint/config.json` | Broker address and application settings |
-| `~/.local/share/hint/signals.json` | This computer's signal definitions |
-| `~/.local/share/hint/.hint.lock` | Coordination between HINT processes |
-| `~/.local/share/hint/venv/` | Installed Python application |
-| `~/.local/bin/hint` | Command |
+| `~/.config/hint/config.json` | Broker and timeout settings |
+| `~/.local/share/hint/signals.json` | Saved actions and schedules |
+| `~/.local/share/hint/.hint.lock` | Coordinates changes to those definitions |
+| `~/.local/share/hint/venv` | Points to the active installed Python environment |
+| `~/.local/share/hint/source` | Points to the source checkout used for updates |
+| `~/.local/bin/hint` | Installed command |
 | `~/.local/share/bash-completion/completions/hint` | Bash completion |
-| `~/.config/systemd/user/hint.service` | Background service |
+| `~/.config/systemd/user/hint.service` | User service |
+| `~/.config/autostart/hint.desktop` | Refreshes the running service with the graphical login session |
 
-Absolute `XDG_CONFIG_HOME` and `XDG_DATA_HOME` values replace the corresponding
-base directories. Relative values are ignored. The source directory can live
-anywhere and can be moved after installation. Keep personal settings and signals
-on each computer. On a new computer, use a clean source copy or archive and
-select its broker address. A Git checkout works too when a repository is
-available. Copying a `signals.json` also copies its scheduled actions.
+Absolute `XDG_CONFIG_HOME` and `XDG_DATA_HOME` replace the corresponding base
+paths. Private temporary sockets live under the user runtime directory, with a
+private temporary-directory fallback when necessary. Run status stays in
+memory: there is no `status.json`. The service keeps active runs and a bounded
+recent history; restarting it clears that history and stops its controlled
+runs. Untracked external windows may remain open. A graphical-login entry refreshes
+the service with the current display session without restarting active runs.
 
-All configuration settings are shown in `config.example.json`:
-
-```json
-{
-  "nats_server": "nats://127.0.0.1:4222",
-  "wake_lead_seconds": 10,
-  "request_timeout_seconds": 10,
-  "discovery_timeout_seconds": 1.0
-}
-```
-
-Set `nats_server` to JSON `null` for local-only operation. The request deadline
-bounds the whole remote operation, including connecting and closing. Discovery
-uses its configured response-collection window plus a short bounded allowance
-for connection and cleanup. Timeout settings accept numbers greater than zero
-and at most 300 seconds. Wake lead accepts integer seconds from 0 to 86400.
-Unknown settings and invalid values are rejected.
-
-After editing configuration, restart the service:
+The default settings are in [config.example.json](config.example.json).
+Set `nats_server` to a full NATS URL, or JSON `null` for local-only operation.
+On an existing installation, edit that file to change the broker, then restart:
 
 ```bash
 systemctl --user restart hint.service
 ```
 
-Settings and signals are private user files. The lock contains no events; leave
-it alone while HINT is running. Deleting an active lock can break coordination.
-
-## Scheduling and wakeup
-
-For a signal two minutes from now on the local computer:
-
-```bash
-hint --set reminder --time "$(date -d '+2 minutes' '+%Y-%m-%d %H:%M:%S')" --action '~/Sounds/ding.wav'
-```
-
-Times use the receiving computer's local wall clock, without a timezone field.
-Use valid, unambiguous local times around daylight-saving transitions. Signals
-are one-shot; overdue entries fire when the service next runs or resumes.
-A failed action start keeps its timed entry for retry; failures are logged.
-Concurrent HINT processes coordinate starts using the table lock. This is
-best-effort scheduling: a crash or storage failure between starting an action
-and saving its removal can cause a repeated action.
-
-Add `--wake` to a timed signal after installing wake support. HINT arms the
-earliest future wake signal with a relative `rtcwake` delay, normally ten seconds
-early. The computer's firmware and Linux RTC must support waking from its
-chosen sleep state. HINT does not suspend the computer itself. Ordinary signals
-need no RTC helper. A wake-helper failure does not stop ordinary scheduling or
-remote service operation.
-
-The user service starts at login and resumes with your session after suspend.
-It does not promise graphical playback before you log in after a reboot.
-GUI actions need the receiving user's desktop session. Installation imports
-available display/session variables; rerun installation from the desktop if
-those were unavailable during setup.
-
-## Actions and playback
-
-| Action | Behavior |
-| --- | --- |
-| Audio file | Plays once with MPV, without a video window |
-| Video file | Plays once fullscreen with MPV |
-| Image file | Displays fullscreen until closed |
-| Directory | Loops immediate files in lexical order, fullscreen; images display for eight seconds |
-| URL or ordinary document | Opens with `xdg-open` |
-| Executable path | Starts that file directly |
-| Command string | Runs through `/bin/sh`; supports redirects, pipes, variables, and command chaining |
-
-Use absolute paths or quoted `~` paths. Service actions run from the user's
-home directory; manually fired actions use the command's working directory.
-Existing file paths and URLs keep the behavior above. Other action strings
-run as noninteractive `/bin/sh` commands when fired:
-
-```bash
-hint --set task --action 'echo booyah > file' --remote hint_server_beacon
-hint --fire task --remote hint_server_beacon
-```
-
-This writes `file` in the receiving user's home directory, overwriting any
-existing contents. `--set` only saves the command. Wrap the whole action in
-single quotes to prevent your local shell from expanding it. Inside those
-quotes, double quotes protect spaces in paths while allowing variables to
-expand on the receiver: `'printf "%s\n" "$HOME" > "home path.txt"'`.
-
-Commands support `>`, `>>`, pipes, `&&`, variables, wildcards, and shell builtins.
-They do not load interactive aliases or `.bashrc`; use an executable script
-for complex actions, or explicitly invoke `bash -c` for Bash-specific syntax.
-Shell syntax is checked before launch. `"fired": true` still means the process
-started: a missing command or later failure is reported by the shell, not by
-the fire response. Remote/scheduled command output goes to the service journal;
-manually launched command output is discarded unless redirected to a file.
-
-Directories are nonrecursive and include all immediate files, including hidden
-and non-media files; use a media-only folder. HTTP(S) media links open through
-the desktop/browser. File routing uses MIME types inferred from file names;
-actual playback depends on the installed MPV.
-
-See [action behavior and the practical test checklist](docs/actions.md) for
-file types, paths, commands, expected lifetimes, and local/remote checks.
-
-Close an image/slideshow window, or press `q` in it, to stop looping playback.
-Single audio and video files exit when finished. CLI-launched actions are
-detached from the terminal. Service-launched actions send diagnostics to the
-service journal; finished children are reaped. Restarting/stopping the service
-also stops its remaining child actions through systemd's normal control group.
+`request_timeout_seconds` bounds a remote operation. Discovery uses its response
+collection window plus a short connection/cleanup allowance. Timeouts must be
+positive and at most 300 seconds. `wake_lead_seconds` is an integer from 0 to
+86400. Unknown settings are rejected. Settings and definitions are private user
+files; the lock contains no actions and should be left alone while HINT runs.
 
 ## Bash completion
 
-Press Tab after an option, signal name, or remote name. Completion supports
-existing names for `--set`, `--get`, `--fire`, and `--remove`; `--set` also accepts
-new names. `--remote` discovers live HINT servers, and a remotely targeted
-operation completes names from that computer. Offline peers produce no
-suggestions after a short deadline. Local completion needs no network.
-Remote-name completion normally finishes after the one-second discovery window
-plus connection and process overhead. Bash caps any completion attempt at two
-seconds to keep the shell responsive; this cap does not add a wait.
-Long custom discovery windows can therefore produce no completion suggestions;
-use `hint --discover` when deliberately waiting longer.
+Press Tab to complete options, saved action names, active temporary names, and
+remote hostnames. Name completion uses fresh local data or a fresh query to the
+selected remote computer. `--set` completes existing names and still accepts
+new ones. Controls include active names even if their saved definitions were
+removed. A missing or unreachable remote never falls back to local names.
 
-For an already open Bash terminal, load the installed completion:
+Completion has its own short network budget and an outer two-second limit.
+It does not wait for a long configured discovery timeout. No answers means no
+candidates, not proof that a computer is absent. Completion never launches an
+action or changes a schedule. Path completion within an arbitrary action string
+is not provided. This integration is for Bash, not Fish or Zsh.
+
+To enable it in an already open Bash terminal:
 
 ```bash
 source "${XDG_DATA_HOME:-$HOME/.local/share}/bash-completion/completions/hint"
 ```
 
-## Diagnose or uninstall
+## Troubleshooting and removal
 
 ```bash
-hint --list
+hint --status
 systemctl --user status hint.service --no-pager
 journalctl --user -u hint.service -n 30 --no-pager
 ```
 
-If local operations work but remote ones fail, check the configured broker,
-recipient name, recipient service, firewall, and VPN LAN settings. A successful
-fire followed by no visible action calls for checking the receiver's journal,
-action path, and desktop environment.
+The journal is the existing system service log. It holds launch diagnostics and
+errors, including a shell command's later failure. You do not need to watch it
+during normal use. If remote operations fail, check the recipient's service,
+the broker URL, authentication, firewall, and VPN LAN settings. If a fire is
+acknowledged but nothing appears, check the receiver's status and journal,
+its action path, and its desktop session.
 
-To uninstall from the project directory:
+From the project directory, `./uninstall.sh` removes the managed installation
+and keeps your settings and saved definitions.
 
-```bash
-./uninstall.sh
-```
-
-Uninstallation preserves personal settings and signal data. It removes HINT's
-wake access rule when installed; shared helper removal waits until no HINT
-user still has an access rule.
-
-## Development and tests
+## Development
 
 ```bash
 python3 -m venv .venv
 .venv/bin/python -m pip install -e .
 sudo apt-get install nats-server
-REQUIRE_NATS_SERVER=1 .venv/bin/python -m unittest discover -s tests -v
+REQUIRE_NATS_SERVER=1 REQUIRE_LOCAL_IPC=1 .venv/bin/python -m unittest discover -s tests -v
 ```
 
-Tests use isolated user directories, harmless commands, a fake player, and an
-isolated loopback NATS broker. Installer tests stub privileged operations.
-They do not change real services or RTC alarms. Without `nats-server`, live
-network tests skip unless `REQUIRE_NATS_SERVER=1` is set. Real display/audio,
-suspend, and firmware wake support still need a test on the target computer.
+Tests use isolated user directories, harmless commands, controlled player
+substitutes, and a loopback NATS broker. Privileged installer operations are
+stubbed. Without `nats-server`, live network tests skip unless
+`REQUIRE_NATS_SERVER=1` is set. Real display/audio and hardware wake behavior
+still need the [target-computer checks](docs/actions.md).
 
-HINT depends on [Agent Messenger](https://github.com/jim-lewis-dev/agent_messenger),
-pinned to tested commit `fdfa9d9ce4c0bd3a6fcfee7177b1fec0b2359e8e`. Messenger
-installs its pinned NATS transport dependency, which installs `nats-py`. HINT
-contains no copies of either library. Installation requires Git and access to
-GitHub. Dependency upgrades are explicit changes followed by HINT's
-compatibility tests.
+HINT depends on Agent Messenger, which installs NATS transport and `nats-py`.
+It contains no copied implementations of those libraries. Dependency changes
+are reviewed with the application tests. See [pyproject.toml](pyproject.toml)
+for the exact dependency revision.
 
 MIT licensed; see [LICENSE](LICENSE).

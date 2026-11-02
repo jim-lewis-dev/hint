@@ -1,5 +1,4 @@
-"""Read-only Bash completion and live HINT peer discovery."""
-
+"""Fresh, read-only Bash completion for local and remote HINT actions."""
 from __future__ import annotations
 
 import json
@@ -7,15 +6,20 @@ from pathlib import Path
 import re
 import sys
 
-
 NAME = re.compile(r"^[A-Za-z0-9_-]+$")
-NAME_OPTIONS = frozenset(("--set", "--fire", "--get", "--remove"))
-VALUE_OPTIONS = NAME_OPTIONS | {"--remote", "--time", "--action"}
-OPERATIONS = NAME_OPTIONS | {"--list", "--discover"}
+DEFINITION_OPTIONS = frozenset(("--set", "--fire", "--get", "--remove"))
+CONTROL_OPTIONS = frozenset(("--pause", "--resume", "--stop"))
+NAME_OPTIONS = DEFINITION_OPTIONS | CONTROL_OPTIONS | {"--status"}
+VALUE_OPTIONS = NAME_OPTIONS | {"--remote", "--time", "--action", "--server"}
+OPTIONAL_VALUES = {"--fire", "--status"}
+OPERATIONS = NAME_OPTIONS | {"--list", "--discover", "--ready"}
 OPTIONS = (
-    "--set", "--fire", "--get", "--remove", "--list", "--discover",
-    "--remote", "--action", "--time", "--wake", "--help",
+    "--set", "--fire", "--pause", "--resume", "--stop", "--status",
+    "--get", "--remove", "--list", "--discover", "--ready",
+    "--remote", "--action", "--time", "--no-time", "--wake", "--no-wake",
+    "--server", "--local", "--enable-wake", "--help"
 )
+COMPLETION_TIMEOUT = 1.6
 
 
 def _read_object(path: Path) -> dict:
@@ -29,112 +33,145 @@ def _read_object(path: Path) -> dict:
 
 def _names(value: object) -> list[str]:
     if not isinstance(value, dict):
-        raise ValueError("signal list must be a JSON object")
+        raise ValueError("action list must contain an object")
     return sorted(name for name, entry in value.items()
                   if isinstance(name, str) and NAME.fullmatch(name) and isinstance(entry, dict))
 
 
-def _context(words: list[str], cword: int):
+def _scan(words: list[str], cword: int):
+    """Classify words without interpreting an action's contents as switches."""
     pending = None
-    remote = None
+    roles = {}
+    values = {}
     used = set()
-    for word in words[1:cword]:
-        if pending:
-            if word == "=":
-                # Bash splits --option=value at its default '=' word break.
-                continue
-            if pending == "--remote":
-                remote = word
-            pending = None
-            continue
-        option, equals, value = word.partition("=")
-        if option not in OPTIONS:
-            continue
-        used.add(option)
-        if option in VALUE_OPTIONS:
-            if equals:
-                if option == "--remote":
-                    remote = value
-            else:
-                pending = option
-    return pending, remote, used
-
-
-def _whole_context(words: list[str], cword: int):
-    """Find a selected remote even when the cursor edits an earlier argument."""
-    pending = None
     remote = None
-    used = set()
+    remote_present = False
     for index, word in enumerate(words[1:], 1):
         if pending:
             if word == "=":
+                roles[index] = pending
                 continue
-            if pending == "--remote" and index != cword:
-                remote = word
-            pending = None
-            continue
-        if index == cword:
-            continue
+            is_option = word.partition("=")[0] in OPTIONS
+            if is_option and (pending in OPTIONAL_VALUES or pending == "--remote"):
+                pending = None
+            else:
+                roles[index] = pending
+                if index != cword:
+                    values[pending] = word
+                    if pending == "--remote":
+                        remote = word or None
+                pending = None
+                continue
         option, equals, value = word.partition("=")
         if option not in OPTIONS:
             continue
         used.add(option)
+        if option == "--remote":
+            remote_present = True
         if option in VALUE_OPTIONS:
             if equals:
-                if option == "--remote":
-                    remote = value
+                roles[index] = option
+                if index != cword:
+                    values[option] = value
+                    if option == "--remote":
+                        remote = value or None
             else:
                 pending = option
-    return remote, used
+    if pending:
+        roles[len(words)] = pending
+    return roles, values, used, remote_present, remote
+
+
+def _status_names(value: object, operation: str) -> list[str]:
+    if not isinstance(value, dict) or not isinstance(value.get("runs"), list):
+        raise ValueError("invalid HINT status")
+    names = set(_names(value.get("definitions", {}))) if operation == "--status" else set()
+    for run in value["runs"]:
+        if not isinstance(run, dict):
+            continue
+        if operation in CONTROL_OPTIONS and not run.get("active"):
+            continue
+        name = run.get("name", run.get("signal"))
+        if isinstance(name, str) and NAME.fullmatch(name):
+            names.add(name)
+    return sorted(names)
 
 
 def complete(words: list[str], cword: int) -> list[str]:
-    """Return candidates for Bash's full COMP_WORDS and COMP_CWORD values."""
     if cword < 1 or cword > len(words):
         return []
     prefix = words[cword] if cword < len(words) else ""
-    pending, _, _ = _context(words, cword)
-    remote, used = _whole_context(words, cword)
-    if pending and prefix == "=":
-        prefix = ""
+    roles, values, used, remote_present, remote = _scan(words, cword)
+    pending = roles.get(cword)
     option, equals, value = prefix.partition("=")
-    attached = equals and option in VALUE_OPTIONS and pending is None
+    attached = bool(equals and option in VALUE_OPTIONS and pending == option)
     if attached:
-        pending, prefix = option, value
-
+        prefix = value
+    elif pending and prefix == "=":
+        prefix = ""
+    if pending in OPTIONAL_VALUES and prefix.startswith("--") and not attached:
+        pending = None
     if pending == "--remote":
-        if "--discover" in used:
+        if used & {"--discover", "--ready"}:
             return []
         from hint_network import discover
-        candidates = discover()
+        candidates = discover(timeout=COMPLETION_TIMEOUT)
     elif pending in NAME_OPTIONS:
-        if remote:
+        if remote_present and (not remote or not NAME.fullmatch(remote)):
+            return []
+        if pending in CONTROL_OPTIONS or pending == "--status":
+            if remote_present:
+                from hint_network import remote as request
+                status = request(remote, ["--status"], timeout=COMPLETION_TIMEOUT)
+            else:
+                from hint_runtime import request
+                from hint_config import HintError, TABLE
+                try:
+                    status = request({"op": "status"}, timeout=COMPLETION_TIMEOUT)
+                except HintError as error:
+                    if pending != "--status" or "not running" not in str(error).lower():
+                        raise
+                    status = {"definitions": _read_object(Path(TABLE)), "runs": []}
+            candidates = _status_names(status, pending)
+        elif remote_present:
             from hint_network import remote as request
-            candidates = _names(request(remote, ["--list"]))
+            candidates = _names(request(remote, ["--list"], timeout=COMPLETION_TIMEOUT))
         else:
             from hint_config import TABLE
             candidates = _names(_read_object(Path(TABLE)))
+        if pending == "--fire" and not prefix and not attached and "--action" not in used:
+            candidates.append("--action")
+        if pending == "--status" and not prefix and not attached and not remote_present:
+            candidates.append("--remote")
     elif pending:
-        # Action strings and calendar times have no finite candidate list.
+        # Arbitrary command text/calendar values are never executed to complete them.
         return []
     else:
         candidates = [candidate for candidate in OPTIONS if candidate not in used]
         if "--set" not in used:
-            candidates = [candidate for candidate in candidates
-                          if candidate not in {"--action", "--time", "--wake"}]
+            forbidden = {"--time", "--no-time", "--wake", "--no-wake"}
+            if "--fire" not in used or "--fire" in values:
+                forbidden.add("--action")
+            candidates = [c for c in candidates if c not in forbidden]
         if used & OPERATIONS:
-            candidates = [candidate for candidate in candidates if candidate not in OPERATIONS]
-        if remote:
-            candidates = [candidate for candidate in candidates if candidate != "--discover"]
-        if "--discover" in used:
-            candidates = [candidate for candidate in candidates if candidate != "--remote"]
-
+            candidates = [c for c in candidates if c not in OPERATIONS]
+        if remote_present:
+            candidates = [c for c in candidates if c not in {"--discover", "--ready"}]
+        if used & {"--discover", "--ready"}:
+            candidates = [c for c in candidates if c != "--remote"]
+        if "--ready" not in used:
+            candidates = [c for c in candidates if c not in {"--server", "--local", "--enable-wake"}]
+        for first, second in (("--time", "--no-time"), ("--wake", "--no-wake"), ("--server", "--local")):
+            if first in used:
+                candidates = [c for c in candidates if c != second]
+            if second in used:
+                candidates = [c for c in candidates if c != first]
     matches = [candidate for candidate in candidates if candidate.startswith(prefix)]
     return [f"{option}={candidate}" for candidate in matches] if attached else matches
 
 
 def main(argv: list[str]) -> int:
-    """Hidden CLI: completion errors and unavailable peers stay quiet."""
+    """Completion failures leave the prompt usable without stderr chatter."""
     try:
         cword = int(argv[0])
         for candidate in complete(argv[1:], cword):

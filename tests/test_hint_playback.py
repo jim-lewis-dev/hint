@@ -1,20 +1,19 @@
-"""Playback lifecycle checks using harmless actions and a fake MPV executable."""
-
-import contextlib
-import io
+"""Owned action lifecycle and media/display dispatch without personal applications."""
 import json
 import os
 from pathlib import Path
 import shlex
+import socket
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
-import hint_playback
+import hint_playback as playback
+from hint_config import HintError
 
 
 def eventually(predicate, timeout=3):
@@ -26,348 +25,318 @@ def eventually(predicate, timeout=3):
     return bool(predicate())
 
 
-def finish_process(process):
-    """Bounded cleanup, including when a lifecycle assertion fails."""
-    try:
-        process.wait(timeout=2)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait(timeout=2)
-
-
 class PlaybackTests(unittest.TestCase):
-    def setUp(self):
-        mode = patch.object(hint_playback, "SERVICE_MODE", False)
-        mode.start()
-        self.addCleanup(mode.stop)
-
-    def test_fire_returns_json_while_action_keeps_running_without_terminal_input(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            environment = os.environ.copy()
-            environment.update({
-                "HOME": str(root / "home"),
-                "XDG_CONFIG_HOME": str(root / "config"),
-                "XDG_DATA_HOME": str(root / "data"),
-                "XDG_STATE_HOME": str(root / "state"),
-                "PYTHONPATH": str(Path(hint_playback.__file__).parent)
-                + os.pathsep + environment.get("PYTHONPATH", ""),
-            })
-            (root / "home").mkdir()
-            release = root / "release"
-            ready = root / "ready.json"
-            finished = root / "finished"
-            heartbeat = root / "heartbeat"
-            action = root / "safe_action.py"
-            action.write_text(
-                f"#!{sys.executable}\n"
-                "import json, pathlib, sys, time\n"
-                f"root = pathlib.Path({str(root)!r})\n"
-                "print('action stdout must not enter the CLI response', flush=True)\n"
-                "print('action stderr must not enter the CLI response', file=sys.stderr, flush=True)\n"
-                "received = sys.stdin.read()\n"
-                "(root / 'ready.tmp').write_text(json.dumps({'stdin': received}))\n"
-                "(root / 'ready.tmp').replace(root / 'ready.json')\n"
-                "deadline = time.monotonic() + 8\n"
-                "while not (root / 'release').exists() and time.monotonic() < deadline:\n"
-                "    with (root / 'heartbeat').open('a') as stream:\n"
-                "        stream.write('.')\n"
-                "    time.sleep(0.02)\n"
-                "(root / 'finished').write_text('finished')\n"
-            )
-            action.chmod(0o755)
-            table = root / "data" / "hint" / "signals.json"
-            table.parent.mkdir(parents=True)
-            table.write_text(
-                json.dumps({"probe": {"action": str(action)}})
-            )
-
-            # If stdout is accidentally inherited, subprocess.run can wait for
-            # the action after killing a timed-out CLI. Release it regardless.
-            watchdog = threading.Timer(5, release.touch)
-            watchdog.daemon = True
-            watchdog.start()
-            try:
-                result = subprocess.run(
-                    [sys.executable, "-m", "hint", "--fire", "probe"],
-                    input="input belonging to the calling terminal\n",
-                    capture_output=True,
-                    text=True,
-                    timeout=3,
-                    env=environment,
-                    cwd=root,
-                )
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(json.loads(result.stdout), {"signal": "probe", "fired": True})
-                self.assertEqual(result.stderr, "")
-                self.assertTrue(eventually(ready.exists), "action did not start")
-                self.assertEqual(json.loads(ready.read_text()), {"stdin": ""})
-                self.assertFalse(finished.exists(), "CLI waited for action completion")
-                self.assertTrue(eventually(heartbeat.exists))
-                before = heartbeat.stat().st_size
-                self.assertTrue(
-                    eventually(lambda: heartbeat.stat().st_size > before),
-                    "action stopped when the CLI exited",
-                )
-            finally:
-                release.touch()
-                watchdog.cancel()
-                watchdog.join(timeout=1)
-                if ready.exists():
-                    self.assertTrue(eventually(finished.exists), "test action did not finish")
-
-    def test_finished_action_is_reaped_without_another_launch(self):
-        created = []
-        real_popen = subprocess.Popen
-
-        def record_process(*args, **kwargs):
-            process = real_popen(*args, **kwargs)
-            if kwargs.get("start_new_session"):
-                created.append(process)
-                self.addCleanup(finish_process, process)
-            return process
-
-        with patch.object(hint_playback.subprocess, "Popen", record_process):
-            hint_playback.launch(shlex.join([sys.executable, "-c", "raise SystemExit(0)"]))
-            self.assertEqual(len(created), 1)
-            process = created[0]
-            # Reading returncode does not poll or reap. Only HINT's own waiter
-            # can collect this exit status before the cleanup registered above.
-            self.assertTrue(
-                eventually(lambda: process.returncode is not None),
-                "HINT left the exited action uncollected",
-            )
-            self.assertEqual(process.returncode, 0)
-
-    def test_failed_action_exit_is_reported(self):
-        created = []
-        real_popen = subprocess.Popen
-
-        def record_process(*args, **kwargs):
-            process = real_popen(*args, **kwargs)
-            if kwargs.get("start_new_session"):
-                created.append(process)
-                self.addCleanup(finish_process, process)
-            return process
-
-        errors = io.StringIO()
-        with contextlib.redirect_stderr(errors), patch.object(hint_playback.subprocess, "Popen", record_process):
-            hint_playback.launch(shlex.join([sys.executable, "-c", "raise SystemExit(17)"]))
-            self.assertTrue(eventually(lambda: "17" in errors.getvalue()))
-            self.assertEqual(created[0].returncode, 17)
-
-    def test_service_keeps_player_diagnostics_without_reading_terminal_input(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            home = root / "home"
-            home.mkdir()
-            details = root / "player.json"
-            player = root / "mpv"
-            player.write_text(
-                f"#!{sys.executable}\n"
-                "import json, os, pathlib, sys\n"
-                "pathlib.Path(os.environ['HINT_TEST_MPV_ARGS']).write_text(json.dumps({\n"
-                "    'argv': sys.argv[1:], 'stdin': sys.stdin.read(), 'cwd': os.getcwd(),\n"
-                "}))\n"
-                "if '--terminal=no' not in sys.argv:\n"
-                "    print('service action output', flush=True)\n"
-                "    print('MPV diagnostic: failed to open audio device', file=sys.stderr, flush=True)\n"
-                "raise SystemExit(23)\n"
-            )
-            player.chmod(0o755)
-            audio = root / "song.mp3"
-            audio.touch()
-            environment = os.environ.copy()
-            environment.update({
-                "HOME": str(home),
-                "PATH": str(root) + os.pathsep + environment.get("PATH", ""),
-                "PYTHONPATH": str(Path(hint_playback.__file__).parent)
-                + os.pathsep + environment.get("PYTHONPATH", ""),
-                "HINT_TEST_MPV_ARGS": str(details),
-                "XDG_CONFIG_HOME": str(root / "config"),
-                "XDG_DATA_HOME": str(root / "data"),
-                "XDG_STATE_HOME": str(root / "state"),
-            })
-            script = (
-                "import sys, threading, hint_playback\n"
-                "hint_playback.SERVICE_MODE = True\n"
-                "hint_playback.launch(sys.argv[1])\n"
-                "for thread in threading.enumerate():\n"
-                "    if thread.name == 'hint-action-wait':\n"
-                "        thread.join(timeout=3)\n"
-                "        if thread.is_alive():\n"
-                "            raise SystemExit('action waiter did not finish')\n"
-            )
-            result = subprocess.run(
-                [sys.executable, "-c", script, str(audio)],
-                input="input that belongs to the service caller\n",
-                capture_output=True, text=True, timeout=5, env=environment, cwd=root,
-            )
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(result.stdout, "")
-            self.assertIn("service action output", result.stderr)
-            self.assertIn("failed to open audio device", result.stderr)
-            self.assertIn("status 23", result.stderr)
-            invocation = json.loads(details.read_text())
-            self.assertEqual(invocation["stdin"], "")
-            self.assertEqual(invocation["cwd"], str(home))
-            self.assertIn("--terminal=yes", invocation["argv"])
-            self.assertIn("--input-terminal=no", invocation["argv"])
-
-    def test_mpv_modes_do_not_take_over_terminal_and_keep_intended_loops(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            executable = root / "mpv"
-            executable.write_text(
-                f"#!{sys.executable}\n"
-                "import json, os, pathlib, sys\n"
-                "target = pathlib.Path(os.environ['HINT_TEST_MPV_ARGS'])\n"
-                "temporary = target.with_suffix('.tmp')\n"
-                "temporary.write_text(json.dumps(sys.argv[1:]))\n"
-                "temporary.replace(target)\n"
-            )
-            executable.chmod(0o755)
-            audio, video, image, slides = (
-                root / "song.mp3", root / "movie.mp4", root / "photo.png", root / "slides"
-            )
-            for path in (audio, video, image):
-                path.touch()
-            slides.mkdir()
-            for filename in ("b.png", "a.png"):
-                (slides / filename).touch()
-
-            for kind, target in (("audio", audio), ("video", video), ("image", image), ("directory", slides)):
-                with self.subTest(kind=kind):
-                    arguments = root / f"{kind}.json"
-                    environment = {
-                        "PATH": str(root) + os.pathsep + os.environ.get("PATH", ""),
-                        "HINT_TEST_MPV_ARGS": str(arguments),
-                    }
-                    with patch.dict(os.environ, environment):
-                        hint_playback.launch(str(target))
-                        self.assertTrue(eventually(arguments.exists), "fake MPV did not start")
-                    argv = json.loads(arguments.read_text())
-                    for option in ("--terminal=no", "--input-terminal=no", "--idle=no", "--keep-open=no"):
-                        self.assertIn(option, argv)
-                    # Last assignment wins in MPV; common defaults must not
-                    # accidentally override the intentional image/slideshow loop.
-                    options = {
-                        item.split("=", 1)[0]: item.split("=", 1)[1]
-                        for item in argv if item.startswith("--") and "=" in item
-                    }
-                    if kind in ("audio", "video"):
-                        self.assertEqual(options.get("--loop-file"), "no")
-                        self.assertEqual(options.get("--loop-playlist"), "no")
-                    if kind == "audio":
-                        self.assertIn("--no-video", argv)
-                    elif kind == "video":
-                        self.assertIn("--fullscreen", argv)
-                    elif kind == "image":
-                        self.assertEqual(options.get("--loop-file"), "inf")
-                    else:
-                        self.assertEqual(options.get("--loop-playlist"), "inf")
-                        self.assertEqual(options.get("--image-display-duration"), "8")
-                        self.assertLess(argv.index(str(slides / "a.png")), argv.index(str(slides / "b.png")))
-
-
-class ShellPlaybackTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
         self.home = self.root / "home with spaces"
-        self.cwd = self.root / "working directory"
         self.home.mkdir()
-        self.cwd.mkdir()
+        environment = patch.dict(os.environ, {"HOME": str(self.home), "DISPLAY": ":99"})
+        environment.start()
+        self.addCleanup(environment.stop)
+        mode = patch.object(playback, "SERVICE_MODE", False)
+        mode.start()
+        self.addCleanup(mode.stop)
 
-    def run_action(self, command, service=False):
-        environment = os.environ.copy()
-        environment.update({
-            "HOME": str(self.home),
-            "PYTHONPATH": str(Path(hint_playback.__file__).parent),
-        })
-        script = (
-            "import sys, threading, hint_playback\n"
-            "hint_playback.SERVICE_MODE = sys.argv[2] == 'service'\n"
-            "hint_playback.launch(sys.argv[1])\n"
-            "for thread in threading.enumerate():\n"
-            "    if thread.name == 'hint-action-wait':\n"
-            "        thread.join(timeout=3)\n"
-            "        if thread.is_alive():\n"
-            "            raise SystemExit('action waiter did not finish')\n"
-        )
-        return subprocess.run(
-            [sys.executable, "-c", script, command, "service" if service else "local"],
-            capture_output=True, text=True, timeout=5, env=environment, cwd=self.cwd,
-        )
+    def launch(self, action):
+        run = playback.launch(action)
+        self.addCleanup(run.stop)
+        return run
 
-    def test_local_redirection_uses_callers_directory_and_fire_is_quiet(self):
-        result = self.run_action("echo booyah > file")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "")
-        self.assertEqual((self.cwd / "file").read_text(), "booyah\n")
-        self.assertFalse((self.home / "file").exists())
+    def test_command_detaches_stdin_and_runs_in_home(self):
+        run = self.launch("read value || :; printf '%s' booyah > file")
+        self.assertTrue(eventually(lambda: run.poll() is not None))
+        self.assertEqual((self.home / "file").read_text(), "booyah")
+        self.assertEqual(run.poll(), 0)
+        self.assertEqual(run.kind, "command")
 
-    def test_shell_builtins_globs_variables_and_short_circuit(self):
+    def test_shell_builtins_expansion_redirection_and_long_commands(self):
         (self.home / "one.txt").touch()
         (self.home / "two.txt").touch()
-        result = self.run_action(
-            'cd "$HOME" && word=booyah && '
-            'printf "%s\\n" "$word" *.txt > result && '
-            'false && touch unexpected || printf "%s\\n" recovered >> result',
-            service=True,
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual((self.home / "result").read_text(), "booyah\none.txt\ntwo.txt\nrecovered\n")
+        run = self.launch('word=booyah; printf "%s\\n" "$word" *.txt > result')
+        self.assertTrue(eventually(lambda: run.poll() is not None))
+        self.assertEqual((self.home / "result").read_text(), "booyah\none.txt\ntwo.txt\n")
+        long_run = self.launch("printf %s " + "x" * 1000 + " > long")
+        self.assertTrue(eventually(lambda: long_run.poll() is not None))
+        self.assertEqual((self.home / "long").read_text(), "x" * 1000)
+
+    def test_invalid_syntax_runs_nothing(self):
+        with self.assertRaisesRegex(HintError, "Invalid command syntax"):
+            playback.launch('touch unexpected; echo "unterminated')
         self.assertFalse((self.home / "unexpected").exists())
 
-    def test_long_shell_command_is_not_rejected_as_a_long_filename(self):
-        value = "x" * 1000
-        result = self.run_action(f"printf %s {value} > result")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual((self.cwd / "result").read_text(), value)
+    def test_finished_child_is_reaped_by_poll_without_next_launch(self):
+        run = self.launch("exit 17")
+        self.assertTrue(eventually(lambda: run.poll() == 17))
+        self.assertEqual(run.process.returncode, 17)
+        with self.assertRaises(ChildProcessError):
+            os.waitpid(run.pid, os.WNOHANG)
 
-    def test_invalid_syntax_does_not_execute_an_earlier_command(self):
-        result = self.run_action('touch unexpected; echo "unterminated')
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("invalid shell syntax", result.stderr)
-        self.assertFalse((self.cwd / "unexpected").exists())
+    def test_pause_resume_and_stop_paused_process_group(self):
+        script = self.root / "heartbeat.py"
+        script.write_text("import pathlib,time\np=pathlib.Path('heartbeat')\nwhile True:\n with p.open('a') as f: f.write('.')\n time.sleep(.02)\n")
+        run = self.launch(shlex.join([sys.executable, str(script)]))
+        marker = self.home / "heartbeat"
+        self.assertTrue(eventually(marker.exists))
+        run.pause()
+        time.sleep(0.05)
+        paused_size = marker.stat().st_size
+        time.sleep(0.12)
+        self.assertEqual(marker.stat().st_size, paused_size)
+        run.resume()
+        self.assertTrue(eventually(lambda: marker.stat().st_size > paused_size))
+        run.pause()
+        run.stop()
+        self.assertTrue(eventually(lambda: run.poll() is not None))
+        self.assertFalse(playback._group_alive(run.pid))
 
-    def test_missing_command_is_an_async_failure_in_service_diagnostics(self):
-        result = self.run_action("hint_nonexistent_command_9f74a2", service=True)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("hint_nonexistent_command_9f74a2", result.stderr)
-        self.assertIn("status 127", result.stderr)
-        self.assertEqual(result.stdout, "")
+    def test_background_child_remains_owned_after_shell_exits(self):
+        run = self.launch("sleep 20 &")
+        self.assertTrue(eventually(lambda: run.process.poll() is not None))
+        self.assertIsNone(run.poll())
+        run.stop()
+        self.assertTrue(eventually(lambda: run.poll() is not None))
+        self.assertFalse(playback._group_alive(run.pid))
 
-    def test_failed_shell_syntax_check_keeps_scheduled_signal_without_side_effects(self):
-        import hint_signals as signals
+    def test_stop_does_not_touch_unrelated_process(self):
+        unrelated = subprocess.Popen(["sleep", "20"], start_new_session=True)
+        self.addCleanup(lambda: unrelated.poll() is None and unrelated.kill())
+        self.addCleanup(lambda: None)
+        run = self.launch("sleep 20")
+        run.stop()
+        self.assertIsNone(unrelated.poll())
+        unrelated.terminate()
+        unrelated.wait(timeout=2)
 
-        table = self.root / "signals.json"
-        marker = self.root / "unexpected"
-        when = "2030-01-01 06:59:00"
-        with patch.object(signals, "TABLE", table), \
-                patch.object(signals, "LOCK", self.root / ".hint.lock"):
-            signals.write_table({"bad_shell": {
-                "action": f'touch "{marker}"; echo "unterminated', "time": when,
-            }})
-            result = signals.fire("bad_shell", when)
-            self.assertFalse(result["fired"])
-            self.assertIn("invalid shell syntax", result["error"])
-            self.assertIn("bad_shell", signals.list_signals())
-            self.assertFalse(marker.exists())
+    def test_existing_executable_requires_execution_bits(self):
+        script = self.root / "script"
+        script.write_text("#!/bin/sh\nprintf executed > result\n")
+        script.chmod(0o755)
+        run = self.launch(str(script))
+        self.assertTrue(eventually(lambda: run.poll() is not None))
+        self.assertEqual((self.home / "result").read_text(), "executed")
+        script.chmod(0o644)
+        with patch.object(playback, "_document", return_value="document") as document:
+            self.assertEqual(playback.launch(str(script)), "document")
+            document.assert_called_once()
 
-    def test_existing_media_paths_and_urls_are_not_interpreted_as_shell(self):
-        media = self.home / "song; echo $HOME > unexpected.mp3"
-        media.touch()
-        url = "https://example.com/?q=$HOME&v=two"
-        with patch.object(hint_playback, "_spawn") as spawn:
-            hint_playback.launch(str(media))
-            self.assertEqual(spawn.call_args.args[0][-1], str(media))
-            self.assertEqual(spawn.call_args.args[0][0], "mpv")
-            hint_playback.launch(url)
-            spawn.assert_called_with(["xdg-open", url])
-        self.assertFalse((self.home / "unexpected.mp3").exists())
+    def test_empty_nul_and_empty_popup_are_rejected(self):
+        for action in ("", " ", "a\0b", "POPUP:", " popup:  "):
+            with self.subTest(action=action), self.assertRaises(HintError):
+                playback.launch(action)
+
+    def test_popup_case_insensitive_prefix_keeps_text_literal(self):
+        message = ' $HOME <b>hello</b>: $(touch unexpected) '
+        for prefix in ("popup:", "POPUP:", "Popup:"):
+            with self.subTest(prefix=prefix), patch.object(playback, "_popup", return_value="popup") as popup:
+                self.assertEqual(playback.launch("  " + prefix + message), "popup")
+                popup.assert_called_once_with(message)
+        self.assertFalse((self.home / "unexpected").exists())
+
+    def test_popup_uses_distro_python_and_its_own_module(self):
+        with patch.dict(os.environ, {"DISPLAY": ":99"}), patch.object(playback, "_spawn", return_value="window") as spawn:
+            self.assertEqual(playback.launch("popup:--help"), "window")
+            argv = spawn.call_args.args[0]
+            self.assertEqual(argv[0], "/usr/bin/python3")
+            self.assertTrue(argv[1].endswith("hint_popup.py"))
+            self.assertEqual(argv[2], "--text=--help")
+            self.assertFalse(spawn.call_args.kwargs["pausable"])
+
+    def test_visual_action_without_desktop_fails_before_spawn(self):
+        with patch.dict(os.environ, {"DISPLAY": "", "WAYLAND_DISPLAY": ""}), patch.object(playback, "_spawn") as spawn:
+            with self.assertRaisesRegex(HintError, "no usable desktop"):
+                playback.launch("popup:hello")
+            with self.assertRaisesRegex(HintError, "no usable desktop"):
+                playback.launch("https://example.com")
+            spawn.assert_not_called()
+
+    def test_visual_media_requires_desktop_but_audio_does_not(self):
+        video = self.root / "movie.mp4"
+        image = self.root / "image.png"
+        audio = self.root / "song.mp3"
+        directory = self.root / "slides"
+        for path in (video, image, audio):
+            path.touch()
+        directory.mkdir()
+        (directory / "a.png").touch()
+        with patch.dict(os.environ, {"DISPLAY": "", "WAYLAND_DISPLAY": ""}), \
+                patch.object(playback, "_spawn", return_value="player") as spawn:
+            for path in (video, image, directory):
+                with self.subTest(path=path), self.assertRaisesRegex(HintError, "no usable desktop"):
+                    playback.launch(str(path))
+            spawn.assert_not_called()
+            self.assertEqual(playback.launch(str(audio)), "player")
+            __import__("shutil").rmtree(spawn.call_args.kwargs["temporary"])
+
+    def test_directory_all_regular_files_filename_order_and_existing_modes(self):
+        directory = self.root / "mixed"
+        directory.mkdir()
+        names = ["z.jpg", "b.mp3", "a.mp4", ".hidden.png", "nonsense.bin"]
+        for name in names:
+            (directory / name).touch()
+        (directory / "subdirectory").mkdir()
+        with patch.object(playback, "_spawn", return_value="player") as spawn:
+            playback.launch(str(directory))
+            argv = spawn.call_args.args[0]
+            self.assertEqual(argv[-len(names):], [str(directory / name) for name in sorted(names)])
+            self.assertIn("--loop-playlist=inf", argv)
+            self.assertIn("--image-display-duration=8", argv)
+            self.assertIn("--input-terminal=no", argv)
+            self.assertIn("--keep-open=no", argv)
+            self.assertIn("--idle=no", argv)
+            self.assertTrue(any(value.startswith("--input-ipc-server=") for value in argv))
+            # Mocked spawning did not consume ownership of its temporary path.
+            import shutil
+            shutil.rmtree(spawn.call_args.kwargs["temporary"])
+
+    def test_single_media_types_keep_loop_and_pause_behavior(self):
+        for suffix, kind, expected, pausable in (
+            (".mp3", "audio", "--loop-file=no", True),
+            (".mp4", "video", "--loop-file=no", True),
+            (".png", "image", "--loop-file=inf", True),
+            (".gif", "image", "--loop-file=inf", True)
+        ):
+            path = self.root / ("item" + suffix)
+            path.touch()
+            with self.subTest(kind=kind), patch.object(playback, "_play", return_value="player") as play:
+                playback.launch(str(path))
+                self.assertIn(expected, play.call_args.args)
+                self.assertEqual(play.call_args.kwargs["kind"], kind)
+                self.assertEqual(play.call_args.kwargs.get("pausable", True), pausable)
+
+    def test_browser_uses_independent_profile_and_fullscreen(self):
+        with patch.dict(os.environ, {"DISPLAY": ":99"}), \
+                patch.object(playback.shutil, "which", side_effect=lambda name: "/usr/bin/firefox" if name == "firefox" else None), \
+                patch.object(playback, "_spawn", return_value="browser") as spawn:
+            url = "https://example.com/?q=$HOME&x=two"
+            self.assertEqual(playback.launch(url), "browser")
+            argv = spawn.call_args.args[0]
+            self.assertIn("--no-remote", argv)
+            self.assertIn("--kiosk", argv)
+            profile = Path(argv[argv.index("--profile") + 1])
+            self.assertEqual(profile.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(argv[-1], url)
+            self.assertFalse(spawn.call_args.kwargs["pausable"])
+            import shutil
+            shutil.rmtree(profile)
+
+    def test_pdf_uses_isolated_browser_and_text_own_viewer(self):
+        pdf, text = self.root / "a.pdf", self.root / "a.txt"
+        pdf.touch()
+        text.write_text("literal <html> $HOME")
+        with patch.dict(os.environ, {"DISPLAY": ":99"}), patch.object(playback, "_browser", return_value="pdf") as browser:
+            self.assertEqual(playback.launch(str(pdf)), "pdf")
+            browser.assert_called_once_with(pdf.as_uri())
+        with patch.dict(os.environ, {"DISPLAY": ":99"}), patch.object(playback, "_popup", return_value="text") as popup:
+            self.assertEqual(playback.launch(str(text)), "text")
+            popup.assert_called_once_with(str(text), file=True)
+
+    def test_unknown_document_fallback_is_untracked(self):
+        path = self.root / "opaque.unknown"
+        path.touch()
+        with patch.dict(os.environ, {"DISPLAY": ":99"}), patch.object(playback, "_spawn", return_value="document") as spawn:
+            playback.launch(str(path))
+            self.assertFalse(spawn.call_args.kwargs["controllable"])
+            self.assertFalse(spawn.call_args.kwargs["pausable"])
+
+    def test_mpv_ipc_pause_resume_and_resource_cleanup(self):
+        try:
+            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            probe.close()
+        except PermissionError:
+            if os.environ.get("REQUIRE_LOCAL_IPC") == "1":
+                raise
+            self.skipTest("AF_UNIX sockets are restricted in this environment")
+        executable = self.root / "mpv"
+        executable.write_text(
+            f"#!{sys.executable}\n"
+            "import json,pathlib,socket,sys\n"
+            "path=next(x.split('=',1)[1] for x in sys.argv if x.startswith('--input-ipc-server='))\n"
+            "s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);s.bind(path);s.listen()\n"
+            "while True:\n"
+            " c,_=s.accept()\n"
+            " with c:\n"
+            "  request=json.loads(c.makefile().readline())\n"
+            "  with pathlib.Path('ipc-commands').open('a') as f:f.write(json.dumps(request['command'])+'\\n')\n"
+            "  c.sendall((json.dumps({'request_id':request['request_id'],'error':'success','data':'next.jpg'})+'\\n').encode())\n"
+            "  if request['command'][0]=='quit':break\n"
+        )
+        executable.chmod(0o755)
+        audio = self.root / "song.mp3"
+        audio.touch()
+        with patch.dict(os.environ, {"PATH": str(self.root) + os.pathsep + os.environ.get("PATH", "")}):
+            run = self.launch(str(audio))
+            temporary = run.temporary
+            run.pause()
+            self.assertTrue(run.paused)
+            run.resume()
+            self.assertFalse(run.paused)
+            self.assertEqual(run.detail, "next.jpg")
+            run.stop()
+            self.assertTrue(eventually(lambda: run.poll() is not None))
+            self.assertFalse(temporary.exists())
+            commands = [json.loads(line) for line in (self.home / "ipc-commands").read_text().splitlines()]
+            self.assertIn(["set_property", "pause", True], commands)
+            self.assertIn(["set_property", "pause", False], commands)
+            self.assertIn(["quit"], commands)
+
+    def test_ipc_protocol_handles_events_and_fragmented_acknowledgement(self):
+        process = MagicMock(pid=123)
+        process.poll.return_value = None
+        run = playback.ManagedAction(process, kind="audio", ipc=self.root / "control.sock")
+        connection = MagicMock()
+        connection.__enter__.return_value = connection
+        connection.recv.side_effect = [b'{"event":"pause"}\n{"request_id":', b'1,"error":"success"}\n']
+        with patch.object(playback.socket, "socket", return_value=connection):
+            run.pause()
+        self.assertTrue(run.paused)
+        request = json.loads(connection.sendall.call_args.args[0])
+        self.assertEqual(request["command"], ["set_property", "pause", True])
+        self.assertEqual(request["request_id"], 1)
+
+    def test_failed_ipc_acknowledgement_does_not_claim_paused(self):
+        process = MagicMock(pid=123)
+        process.poll.return_value = None
+        run = playback.ManagedAction(process, kind="audio", ipc=self.root / "control.sock")
+        connection = MagicMock()
+        connection.__enter__.return_value = connection
+        connection.recv.return_value = b'{"request_id":1,"error":"property unavailable"}\n'
+        with patch.object(playback.socket, "socket", return_value=connection):
+            with self.assertRaisesRegex(HintError, "Media control failed"):
+                run.pause()
+        self.assertFalse(run.paused)
+
+    def test_snap_browser_profile_uses_its_accessible_common_directory(self):
+        temporary = playback._temporary("browser", browser="/snap/bin/firefox")
+        self.addCleanup(lambda: __import__("shutil").rmtree(temporary, ignore_errors=True))
+        self.assertEqual(temporary.parent, self.home / "snap/firefox/common")
+        self.assertEqual(temporary.stat().st_mode & 0o777, 0o700)
+
+    def test_office_uses_separate_read_only_profile(self):
+        path = self.root / "sheet.xlsx"
+        path.touch()
+        with patch.dict(os.environ, {"DISPLAY": ":99"}), \
+                patch.object(playback.shutil, "which", return_value="/usr/bin/libreoffice"), \
+                patch.object(playback, "_spawn", return_value="office") as spawn, \
+                patch.object(playback, "_fullscreen_owned") as fullscreen:
+            self.assertEqual(playback.launch(str(path)), "office")
+            argv = spawn.call_args.args[0]
+            self.assertIn("--view", argv)
+            self.assertTrue(any(arg.startswith("-env:UserInstallation=file:") for arg in argv))
+            self.assertEqual(argv[-1], str(path))
+            fullscreen.assert_called_once_with("office")
+            __import__("shutil").rmtree(spawn.call_args.kwargs["temporary"])
+
+    def test_missing_player_cleans_private_socket_directory(self):
+        path = self.root / "song.mp3"
+        path.touch()
+        temporary = self.root / "private"
+        temporary.mkdir()
+        with patch.object(playback, "_temporary", return_value=temporary), patch.dict(os.environ, {"PATH": ""}):
+            with self.assertRaisesRegex(HintError, "not available"):
+                playback.launch(str(path))
+        self.assertFalse(temporary.exists())
 
 
 if __name__ == "__main__":

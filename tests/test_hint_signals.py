@@ -12,7 +12,7 @@ import threading
 import time
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import hint_signals as signals
 import rtc_helper
@@ -39,7 +39,15 @@ class SignalTests(unittest.TestCase):
         self.context.enter_context(patch.object(signals, "datetime", FrozenDateTime))
         self.context.enter_context(patch.object(signals, "config", return_value={"wake_lead_seconds": 10}))
         self.rtc = self.context.enter_context(patch.object(signals.subprocess, "run", side_effect=success))
-        self.launch = self.context.enter_context(patch.object(signals, "launch"))
+        self.launch = Mock()
+        signals._PENDING_CLEARS.clear()
+        signals._REPORTED_ERRORS.clear()
+
+    def launched(self, name, action):
+        return self.launch(action)
+
+    def fire(self, name, when=None):
+        return signals.fire(name, when, launcher=self.launched)
 
     def rtc_arguments(self):
         return [call.args[0][-1] for call in self.rtc.call_args_list]
@@ -153,22 +161,23 @@ class SignalTests(unittest.TestCase):
 
     def test_manual_fire_preserves_a_schedule_and_launch_failure_preserves_it(self):
         signals.set_signal("bell", "fake", "2030-01-01 07:01:00", False)
-        self.assertTrue(signals.fire("bell")["fired"])
+        self.assertTrue(self.fire("bell")["fired"])
         self.assertIn("bell", signals.list_signals())
         self.launch.side_effect = signals.HintError("missing executable")
-        self.assertFalse(signals.fire("bell", "2030-01-01 07:01:00")["fired"])
+        self.assertFalse(self.fire("bell", "2030-01-01 07:01:00")["fired"])
         self.assertIn("bell", signals.list_signals())
         self.rtc.assert_not_called()
 
-    def test_scheduled_fire_is_removed_even_if_next_alarm_cannot_be_armed(self):
+    def test_scheduled_fire_retains_definition_even_if_next_alarm_cannot_be_armed(self):
         when = "2030-01-01 06:59:00"
         signals.write_table({"bell": {"action": "fake", "time": when, "wake": True}})
         self.rtc.side_effect = subprocess.TimeoutExpired("sudo", signals.RTC_TIMEOUT)
         errors = io.StringIO()
         with redirect_stderr(errors):
-            self.assertTrue(signals.fire("bell", when)["fired"])
-        self.assertEqual(signals.list_signals(), {})
-        self.assertIn("timed out", errors.getvalue())
+            result = self.fire("bell", when)
+        self.assertTrue(result["fired"])
+        self.assertEqual(signals.list_signals(), {"bell": {"action": "fake", "wake": True}})
+        self.assertIn("timed out", result["warning"])
         self.launch.assert_called_once_with("fake")
 
     def test_simultaneous_schedulers_start_one_action(self):
@@ -191,7 +200,7 @@ class SignalTests(unittest.TestCase):
             try:
                 if second:
                     second_started.set()
-                results.append(signals.fire("bell", when))
+                results.append(self.fire("bell", when))
             except BaseException as exc:
                 errors.append(exc)
 
@@ -222,23 +231,24 @@ class SignalTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.launch.assert_called_once_with("fake")
         self.assertEqual(sum(result["fired"] for result in results), 1)
-        self.assertEqual(signals.list_signals(), {})
+        self.assertEqual(signals.list_signals(), {"bell": {"action": "fake"}})
 
-    def test_due_signals_fire_in_order_and_are_removed(self):
+    def test_due_signals_fire_in_order_and_keep_definitions(self):
         signals.write_table({
             "later": {"action": "later", "time": "2030-01-01 06:59:00"},
             "early": {"action": "early", "time": "2030-01-01 06:58:00"},
             "future": {"action": "future", "time": "2030-01-01 07:01:00"},
         })
-        signals.fire_due()
+        signals.fire_due(launcher=self.launched)
         self.assertEqual([call.args[0] for call in self.launch.call_args_list], ["early", "later"])
-        self.assertEqual(set(signals.list_signals()), {"future"})
+        self.assertEqual(set(signals.list_signals()), {"early", "later", "future"})
+        self.assertNotIn("time", signals.list_signals()["early"])
+        self.assertNotIn("time", signals.list_signals()["later"])
         self.rtc.assert_not_called()
 
     def test_table_validation_accepts_false_wake_and_rejects_malformed_data(self):
         signals.validate("bell", {"action": "fake", "wake": False})
         bad_entries = [None, {"action": ""}, {"action": "fake", "wake": 1},
-                       {"action": "fake", "wake": True},
                        {"action": "fake", "time": 7},
                        {"action": "fake", "time": "2030-1-1 07:00:00"},
                        {"action": "fake", "time": "2030-02-30 07:00:00"}]
@@ -260,6 +270,107 @@ class SignalTests(unittest.TestCase):
                 with self.assertRaises(signals.HintError):
                     signals.read_table()
         self.rtc.assert_not_called()
+
+
+    def test_partial_set_keeps_unspecified_fields_and_clears_independently(self):
+        created = signals.set_signal("bell", "old", "2030-01-01 07:01", True)
+        self.assertTrue(created["created"])
+        self.assertEqual(created["changed"], ["action", "time", "wake"])
+        changed = signals.set_signal("bell", action="new")
+        self.assertEqual(changed["changed"], ["action"])
+        self.assertEqual(changed["definition"], {"action": "new", "time": "2030-01-01 07:01:00", "wake": True})
+        cleared = signals.set_signal("bell", no_time=True)
+        self.assertEqual(cleared["definition"], {"action": "new", "wake": True})
+        self.assertEqual(self.rtc_arguments()[-1], "disable")
+        rescheduled = signals.set_signal("bell", when="2030-01-01 08")
+        self.assertEqual(rescheduled["definition"]["time"], "2030-01-01 08:00:00")
+        self.assertTrue(rescheduled["definition"]["wake"])
+        disabled = signals.set_signal("bell", wake=False)
+        self.assertNotIn("wake", disabled["definition"])
+        self.assertIn("time", disabled["definition"])
+        self.assertEqual(signals.set_signal("bell", wake=False)["changed"], [])
+
+    def test_clearing_last_schedule_disarms_even_when_wake_preference_retained(self):
+        signals.set_signal("bell", "action", "2030-01-01 07:01", True)
+        self.rtc.reset_mock()
+        signals.set_signal("bell", no_time=True)
+        self.assertEqual(self.rtc_arguments(), ["disable"])
+        self.rtc.reset_mock()
+        signals.arm_wake()
+        signals.remove_signal("bell")
+        self.rtc.assert_not_called()
+
+    def test_invalid_partial_edits_do_not_change_saved_data(self):
+        signals.set_signal("bell", "action")
+        original = self.table.read_bytes()
+        cases = [
+            {"action": ""}, {"action": "popup:  "}, {"action": "bad\0action"},
+            {"when": "2030-01-01 07:01", "no_time": True}, {"wake": 1},
+            {"when": "2029"}, {}
+        ]
+        for kwargs in cases:
+            with self.subTest(kwargs=kwargs), self.assertRaises(signals.HintError):
+                signals.set_signal("bell", **kwargs)
+            self.assertEqual(self.table.read_bytes(), original)
+        with self.assertRaisesRegex(signals.HintError, "requires --action"):
+            signals.set_signal("missing", when="2031")
+        with self.assertRaisesRegex(signals.HintError, "No action named"):
+            signals.get_signal("missing")
+        for name in ("HINT-001", "hint-01", "HiNt-2000"):
+            with self.subTest(name=name), self.assertRaisesRegex(signals.HintError, "reserved"):
+                signals.set_signal(name, "fake")
+
+    def test_calendar_defaults_and_invalid_components(self):
+        cases = {
+            "2031": "2031-01-01 00:00:00",
+            "2031-06": "2031-06-01 00:00:00",
+            "2031-06-12": "2031-06-12 00:00:00",
+            "2031-06-12 09": "2031-06-12 09:00:00",
+            "2031-06-12 09:42": "2031-06-12 09:42:00",
+            "2031-06-12 09:42:51": "2031-06-12 09:42:51",
+            "2031 09": "2031-01-01 09:00:00"
+        }
+        for value, expected in cases.items():
+            with self.subTest(value=value):
+                self.assertEqual(signals.parse_time(value).strftime(signals.TIME_FORMAT), expected)
+        for value in ("", "09:00", "2031-00", "2031-13", "2031-02-29", "2031-06-00", "2031-06-12 24", "2031-06-12 09:60", "2031-06-12 09:42:60", "2031-1-1", "2031-01-01T09:00", "0000"):
+            with self.subTest(value=value), self.assertRaises(signals.HintError):
+                signals.parse_time(value)
+
+    def test_dst_gaps_and_repeated_times_are_rejected_on_receiver(self):
+        with patch.dict(os.environ, {"TZ": "America/Chicago"}):
+            with self.assertRaisesRegex(signals.HintError, "does not exist"):
+                signals.parse_time("2030-03-10 02:30")
+            with self.assertRaisesRegex(signals.HintError, "occurs twice"):
+                signals.parse_time("2030-11-03 01:30")
+            self.assertEqual(signals.display_time("2030-06-12 09"), "2030-06-12 09:00:00 CDT")
+            self.assertEqual(signals.display_time("2030-12-12 09"), "2030-12-12 09:00:00 CST")
+
+    def test_schedule_clear_failure_retries_save_without_relaunch(self):
+        when = "2030-01-01 06:59:00"
+        signals.write_table({"bell": {"action": "fake", "time": when}})
+        original = self.table.read_bytes()
+        with patch.object(signals, "write_table", side_effect=signals.HintError("disk full")):
+            with redirect_stderr(io.StringIO()) as errors:
+                signals.fire_due(launcher=self.launched)
+                signals.fire_due(launcher=self.launched)
+            self.assertEqual(errors.getvalue().count("could not clear its schedule"), 1)
+        self.assertEqual(self.table.read_bytes(), original)
+        self.launch.assert_called_once_with("fake")
+        signals.fire_due(launcher=self.launched)
+        signals.fire_due(launcher=self.launched)
+        self.launch.assert_called_once_with("fake")
+        self.assertEqual(signals.list_signals(), {"bell": {"action": "fake"}})
+        self.assertEqual(signals._PENDING_CLEARS, set())
+
+    def test_scheduler_skips_deleted_or_rescheduled_snapshot(self):
+        when = "2030-01-01 06:59:00"
+        signals.write_table({"bell": {"action": "fake", "time": when}})
+        signals.set_signal("bell", when="2031")
+        self.assertEqual(self.fire("bell", when)["error"], "stale time")
+        self.launch.assert_not_called()
+        signals.remove_signal("bell")
+        self.assertEqual(self.fire("bell", when)["error"], "signal not found")
 
 
 class RtcHelperTests(unittest.TestCase):

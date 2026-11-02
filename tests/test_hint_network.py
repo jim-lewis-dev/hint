@@ -30,7 +30,7 @@ class NetworkTests(unittest.TestCase):
     def test_local_only_rejects_network_operations_without_starting_worker(self):
         with patch.object(hint, "config", return_value={"nats_server": None}), \
                 patch.object(subprocess, "run", side_effect=AssertionError("worker started")):
-            for operation in (network.discover, lambda: network.remote("hint_server_test", ["--list"])):
+            for operation in (network.discover, lambda: network.remote("test", ["--list"])):
                 with self.assertRaisesRegex(hint.HintError, "disabled"):
                     operation()
 
@@ -59,8 +59,8 @@ class NetworkTests(unittest.TestCase):
         try:
             started = time.monotonic()
             with patch.object(hint, "config", return_value=config):
-                with self.assertRaisesRegex(hint.HintError, "timed out"):
-                    network.remote("hint_server_test", ["--list"])
+                with self.assertRaisesRegex(hint.HintError, "No reply|timed out"):
+                    network.remote("test", ["--list"])
             self.assertLess(time.monotonic() - started, 2)
             self.assertTrue(accepted, "client never reached the unresponsive test server")
         finally:
@@ -81,11 +81,72 @@ class NetworkTests(unittest.TestCase):
         with patch.object(hint, "config", return_value=config), \
                 patch.object(network.subprocess, "run", return_value=result):
             with self.assertRaises(hint.HintError) as raised:
-                network.remote("hint_server_test", ["--list"])
+                network.remote("test", ["--list"])
         self.assertNotIn("private-password", str(raised.exception))
         self.assertNotIn("alice", str(raised.exception))
         self.assertIn("[redacted]", str(raised.exception))
         self.assertIn("connect", str(raised.exception))
+
+    def test_hostnames_route_directly_without_discovery(self):
+        envelope = subprocess.CompletedProcess([], 0, json.dumps({"ok": True, "value": {}}), "")
+        with patch.object(hint, "config", return_value={"nats_server": "nats://localhost:4222"}), \
+                patch.object(network.subprocess, "run", return_value=envelope) as run, \
+                patch.object(network, "discover", side_effect=AssertionError("discovery required")):
+            self.assertEqual(network.remote("dirtsy", ["--list"]), {})
+            body = json.loads(run.call_args.kwargs["input"])
+            self.assertEqual(body["recipient"], "hint_server_dirtsy")
+            self.assertEqual(body["argv"], ["--list"])
+
+    def test_hostname_prefix_is_not_mistaken_for_an_internal_identity(self):
+        self.assertEqual(network._recipient("hint_server_lab"), "hint_server_hint_server_lab")
+        with patch.object(network, "_run_client", return_value={"error": "unrecognized arguments: --pause stretch"}) as run:
+            reply = network.remote("hint_server_lab", ["--pause", "stretch"])
+            self.assertEqual(run.call_args.kwargs["recipient"], "hint_server_hint_server_lab")
+            self.assertEqual(reply["error"], "'hint_server_lab' does not support pause. Run hint --ready on that computer.")
+        self.assertEqual(network._timeout_message({"recipient": "hint_server_hint_server_lab", "argv": ["--status"]}),
+                         "No reply from 'hint_server_lab'. Check HINT on that computer.")
+
+    def test_literal_action_options_do_not_change_timeout_or_preflight(self):
+        for action in ("--list", "--get", "--status", "--set"):
+            with self.subTest(action=action):
+                argv = ["--fire", "--action", action]
+                message = network._timeout_message({"recipient": "hint_server_dirtsy", "argv": argv})
+                self.assertIn("may have taken effect", message)
+                with patch.object(network, "_run_client", return_value={"fired": True}) as run:
+                    self.assertEqual(network.remote("dirtsy", argv), {"fired": True})
+                    run.assert_called_once_with("remote", recipient="hint_server_dirtsy", argv=argv, timeout=None)
+        for argv in (["--get", "--fire"], ["--get=--fire"], ["--status=--set"]):
+            self.assertEqual(network._timeout_message({"recipient": "hint_server_dirtsy", "argv": argv}),
+                             "No reply from 'dirtsy'. Check HINT on that computer.")
+
+    def test_partial_set_preflight_never_mutates_an_older_peer(self):
+        with patch.object(hint, "config", return_value={"nats_server": "nats://localhost:4222"}), \
+                patch.object(network, "_run_client", return_value={"error": "unrecognized arguments: --status"}) as run:
+            result = network.remote("dirtsy", ["--set", "stretch", "--action", "popup:new"])
+            self.assertIn("does not support partial updates", result["error"])
+            self.assertEqual(run.call_count, 1)
+            self.assertEqual(run.call_args.kwargs["argv"], ["--status"])
+
+    def test_partial_set_preflight_and_mutation_share_one_deadline(self):
+        replies = [{"op": "status", "capabilities": ["partial-set"]}, {"op": "set"}]
+        with patch.object(hint, "config", return_value={"nats_server": "nats://localhost:4222", "request_timeout_seconds": 3}), \
+                patch.object(network, "_run_client", side_effect=replies) as run, \
+                patch.object(network.time, "monotonic", side_effect=[10.0, 11.5]):
+            result = network.remote("dirtsy", ["--set", "stretch", "--action", "popup:new"])
+            self.assertEqual(result, {"op": "set"})
+            self.assertEqual(run.call_args_list[0].kwargs["timeout"], 3)
+            self.assertEqual(run.call_args_list[1].kwargs["timeout"], 1.5)
+            self.assertEqual(run.call_args_list[1].kwargs["argv"], ["--set", "stretch", "--action", "popup:new"])
+
+    def test_completion_budget_overrides_long_configured_discovery(self):
+        envelope = subprocess.CompletedProcess([], 0, json.dumps({"ok": True, "value": ["hint_server_dirtsy"]}), "")
+        config = {"nats_server": "nats://localhost:4222", "discovery_timeout_seconds": 300}
+        with patch.object(hint, "config", return_value=config), \
+                patch.object(network.subprocess, "run", return_value=envelope) as run:
+            self.assertEqual(network.discover(timeout=1.6), ["dirtsy"])
+            self.assertLessEqual(run.call_args.kwargs["timeout"], 1.6)
+            self.assertLessEqual(json.loads(run.call_args.kwargs["input"])["config"]["discovery_timeout_seconds"], 1.1)
+        self.assertEqual(config["discovery_timeout_seconds"], 300)
 
     def test_supervisor_reaps_unresponsive_worker_and_stops_promptly(self):
         process = subprocess.Popen([sys.executable, "-c", "import time;time.sleep(30)"],
@@ -162,13 +223,38 @@ class LiveNetworkTests(unittest.TestCase):
         self.addCleanup(patcher.stop)
 
     def test_live_remote_preserves_existing_command_string_and_json_response(self):
-        self.assertEqual(network.remote(self.responder.name, ["--list"]), self.reply)
+        self.assertEqual(network.remote("test", ["--list"]), self.reply)
         self.assertEqual(self.received, ["hint --list"])
         self.reply = {"error": "unknown signal: missing"}
-        self.assertEqual(network.remote(self.responder.name, ["--get", "missing"]), self.reply)
+        self.assertEqual(network.remote("test", ["--get", "missing"]), self.reply)
         self.assertEqual(self.received[-1], "hint --get missing")
 
+    def test_live_hostname_with_internal_prefix_is_unambiguous(self):
+        from agent_messenger import AgentMessenger
+        from nats_transport import NatsTransport
+        peer = AgentMessenger("hint_server_hint_server_lab", NatsTransport(self.server_url))
+        self.addCleanup(peer.close)
+        received = []
+
+        def reply(event):
+            if event["type"] == "in_request":
+                received.append(event["payload"])
+                peer.respond(event["request_id"], json.dumps({"on_lab": {"action": "unused"}}))
+
+        peer.listen(reply)
+        self.assertEqual(network.remote("hint_server_lab", ["--list"]), {"on_lab": {"action": "unused"}})
+        self.assertEqual(received, ["hint --list"])
+        self.assertIn("hint_server_lab", network.discover())
+
     def test_live_remote_shell_action_runs_only_on_receiving_computer(self):
+        try:
+            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        except PermissionError:
+            if os.environ.get("REQUIRE_LOCAL_IPC") == "1":
+                self.fail("Unix sockets are required for the full service integration test")
+            self.skipTest("environment prohibits Unix sockets; full service integration runs on Ubuntu CI")
+        else:
+            probe.close()
         # Use real CLI and server worker processes with separate homes. A
         # serialization-only test cannot catch local expansion or a wrong cwd.
         root = Path(__file__).resolve().parents[1]
@@ -189,6 +275,7 @@ class LiveNetworkTests(unittest.TestCase):
                 return {**os.environ, "HOME": str(home),
                         "XDG_CONFIG_HOME": str(home / "config"),
                         "XDG_DATA_HOME": str(home / "data"),
+                        "XDG_RUNTIME_DIR": str(home / "runtime"),
                         "PYTHONPATH": os.pathsep.join(filter(None, (
                             str(root), os.environ.get("PYTHONPATH"))))}
 
@@ -198,23 +285,21 @@ class LiveNetworkTests(unittest.TestCase):
             errors = temporary / "worker-errors"
             with output.open("w") as stdout, errors.open("w") as stderr:
                 worker = subprocess.Popen(
-                    [sys.executable, "-u", "-m", "hint_network", "--server-worker"],
-                    stdin=subprocess.PIPE, stdout=stdout, stderr=stderr,
+                    [sys.executable, "-u", "-m", "hint", "--serve"],
+                    stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr,
                     cwd=launch_directory, env=receiver_environment, text=True,
                 )
                 try:
-                    worker.stdin.write(json.dumps(configuration))
-                    worker.stdin.close()
                     deadline = time.monotonic() + 5
-                    while '"event": "ready"' not in output.read_text():
+                    while "HINT listening on" not in output.read_text():
                         if worker.poll() is not None or time.monotonic() >= deadline:
                             self.fail("remote worker did not start: " + errors.read_text())
                         time.sleep(0.01)
 
                     def cli(*arguments):
                         result = subprocess.run(
-                            [sys.executable, "-m", "hint", *arguments,
-                             "--remote", network.server_name()],
+                            [sys.executable, "-c", "import json,sys,hint; print(json.dumps(hint.run(sys.argv[1:])))", *arguments,
+                             "--remote", network.hostname()],
                             cwd=sender, env=sender_environment, text=True,
                             capture_output=True, timeout=5,
                         )
@@ -230,14 +315,15 @@ class LiveNetworkTests(unittest.TestCase):
                         + " >> \"$HOME/result with spaces\""
                     )
                     expected = {"shell_test": {"action": action}}
-                    self.assertEqual(cli("--set", "shell_test", "--action", action), expected)
+                    self.assertEqual(cli("--set", "shell_test", "--action", action)["definition"], expected["shell_test"])
                     self.assertEqual(json.loads(
                         (receiver / "data/hint/signals.json").read_text()), expected)
                     self.assertFalse((receiver / "result with spaces").exists(),
                                      "setting a signal must not execute its command")
                     self.assertFalse((receiver / "relative-result").exists())
-                    self.assertEqual(cli("--fire", "shell_test"),
-                                     {"signal": "shell_test", "fired": True})
+                    fired = cli("--fire", "shell_test")
+                    self.assertNotIn("error", fired, fired)
+                    self.assertTrue(fired["fired"])
 
                     expected_output = text.upper() + "\n$HOME > | && literal\n"
                     deadline = time.monotonic() + 3
@@ -255,6 +341,24 @@ class LiveNetworkTests(unittest.TestCase):
                         self.assertFalse((other / "result with spaces").exists())
                         self.assertFalse((other / "relative-result").exists())
                     self.assertFalse((sender / "data/hint/signals.json").exists())
+                    unnamed = cli("--fire", "--action", "sleep 30")
+                    self.assertTrue(unnamed.get("fired"), unnamed)
+                    self.assertEqual(unnamed["signal"], "HINT-001")
+                    cli("--pause", "HINT-001")
+                    status = cli("--status", "HINT-001")
+                    self.assertEqual(status["runs"][0]["state"], "paused")
+                    cli("--resume", "HINT-001")
+                    cli("--stop", "HINT-001")
+                    status = cli("--status", "HINT-001")
+                    self.assertFalse(any(run["active"] for run in status["runs"]))
+                    cli("--set", "repeat", "--action", "sleep 30")
+                    self.assertTrue(cli("--fire", "repeat").get("fired"))
+                    self.assertTrue(cli("--fire", "repeat").get("fired"))
+                    status = cli("--status", "repeat")
+                    self.assertEqual(sum(run["active"] for run in status["runs"]), 2)
+                    cli("--stop", "repeat")
+                    self.assertFalse(any(run["active"] for run in cli("--status", "repeat")["runs"]))
+
                 finally:
                     network._stop_process(worker)
 
@@ -263,12 +367,28 @@ class LiveNetworkTests(unittest.TestCase):
         from nats_transport import NatsTransport
         unrelated = AgentMessenger("other_agent", NatsTransport(self.server_url))
         self.addCleanup(unrelated.close)
-        self.assertEqual(network.discover(), [self.responder.name])
+        self.assertEqual(network.discover(), ["test"])
+
+    def test_new_operation_on_old_peer_has_actionable_update_message(self):
+        self.reply = {"error": "unrecognized arguments: --pause stretch"}
+        reply = network.remote("test", ["--pause", "stretch"])
+        self.assertEqual(reply["error"], "'test' does not support pause. Run hint --ready on that computer.")
+        self.assertEqual(self.received, ["hint --pause stretch"])
+
+    def test_remote_completion_reflects_additions_and_removals_immediately(self):
+        import hint_completion
+        words = ["hint", "--remote", "test", "--fire", "remote_"]
+        self.assertEqual(hint_completion.complete(words, 4), ["remote_alarm"])
+        self.reply = {"remote_new": {"action": "unused"}}
+        self.assertEqual(hint_completion.complete(words, 4), ["remote_new"])
+        self.reply = {}
+        self.assertEqual(hint_completion.complete(words, 4), [])
+        self.assertEqual(self.received, ["hint --list", "hint --list", "hint --list"])
 
     def test_malformed_remote_json_shape_is_an_error(self):
         self.reply = ["unexpected"]
         with self.assertRaisesRegex(hint.HintError, "invalid response"):
-            network.remote(self.responder.name, ["--list"])
+            network.remote("test", ["--list"])
 
     def test_completed_reply_survives_stalled_cleanup_without_repeating_command(self):
         worker = '''
@@ -291,16 +411,16 @@ raise SystemExit(hint_network._client_worker(json.load(sys.stdin)))
         self.config["request_timeout_seconds"] = 1.0
         started = time.monotonic()
         with patch.object(subprocess, "Popen", side_effect=start_process):
-            self.assertEqual(network.remote(self.responder.name, ["--fire", "alarm"]), self.reply)
+            self.assertEqual(network.remote("test", ["--fire", "alarm"]), self.reply)
         self.assertLess(time.monotonic() - started, 2)
         self.assertEqual(self.received, ["hint --fire alarm"])
         self.assertTrue(children and all(child.poll() is not None for child in children))
 
     def test_completion_uses_live_remote_discovery_and_names(self):
         import hint_completion
-        self.assertEqual(hint_completion.complete(["hint", "--remote", "hint_server_t"], 2),
-                         ["hint_server_test"])
-        words = ["hint", "--get", "remote_", "--remote", "hint_server_test"]
+        self.assertEqual(hint_completion.complete(["hint", "--remote", "t"], 2),
+                         ["test"])
+        words = ["hint", "--get", "remote_", "--remote", "test"]
         self.assertEqual(hint_completion.complete(words, 2), ["remote_alarm"])
         self.assertEqual(self.received, ["hint --list"])
 
@@ -327,13 +447,13 @@ raise SystemExit(hint_network._client_worker(json.load(sys.stdin)))
             command.chmod(0o755)
             shell = '''
 source "$1"
-COMP_WORDS=("$2" --remote hint_server_t)
+COMP_WORDS=("$2" --remote t)
 COMP_CWORD=2
 _hint
 printf '%s\\n' "${COMPREPLY[@]}"
 '''
             cases = (
-                ("CLI", [str(command), "--discover"]),
+                ("CLI", [sys.executable, "-c", "import json,hint_network; print(json.dumps(hint_network.discover()))"]),
                 ("Bash completion", ["bash", "--noprofile", "--norc", "-c", shell,
                                      "test", str(root / "completions/hint.bash"), str(command)]),
             )
@@ -353,7 +473,7 @@ printf '%s\\n' "${COMPREPLY[@]}"
                                                 text=True, capture_output=True, timeout=5, check=True)
                     self.assertEqual(len(queries), 1, "first poll should find the delayed peer")
                     found = json.loads(result.stdout) if label == "CLI" else result.stdout.splitlines()
-                    self.assertEqual(found, [self.responder.name])
+                    self.assertEqual(found, ["test"])
                     self.assertEqual(result.stderr, "")
 
     def test_server_recovers_after_its_native_connection_closes(self):
@@ -385,7 +505,9 @@ raise SystemExit(network._server_worker(json.load(sys.stdin)))
             return process
 
         stop = threading.Event()
-        thread = threading.Thread(target=network.serve, args=(stop,), daemon=True)
+        states = []
+        thread = threading.Thread(target=network.serve, args=(stop,),
+                                  kwargs={"state_callback": states.append}, daemon=True)
         with tempfile.TemporaryDirectory() as directory, \
                 patch.dict(os.environ, {"XDG_CONFIG_HOME": directory + "/config",
                                         "XDG_DATA_HOME": directory + "/data"}), \
@@ -397,7 +519,7 @@ raise SystemExit(network._server_worker(json.load(sys.stdin)))
                 while time.monotonic() < deadline:
                     if len(workers) >= 2:
                         try:
-                            reply = network.remote(network.server_name(), ["--list"])
+                            reply = network.remote(network.hostname(), ["--list"])
                         except hint.HintError:
                             pass
                         else:
@@ -411,6 +533,8 @@ raise SystemExit(network._server_worker(json.load(sys.stdin)))
                 stop.set()
                 thread.join(2)
         self.assertFalse(thread.is_alive())
+        self.assertIn("connected", states)
+        self.assertIn("unavailable", states)
         self.assertTrue(all(worker.poll() is not None for worker in workers))
 
 

@@ -5,13 +5,13 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "human-interrupt"
 version = "0.1.6"
-description = "Named local and remote desktop signals with optional scheduling and wakeup"
+description = "Launch reminders, media, messages and commands locally, remotely or on a schedule"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{name = "Jim Lewis"}]
-dependencies = ["agent-messenger @ git+https://github.com/jim-lewis-dev/agent_messenger.git@fdfa9d9ce4c0bd3a6fcfee7177b1fec0b2359e8e"]
+dependencies = ["agent-messenger @ git+https://github.com/jim-lewis-dev/agent_messenger.git@fdfa9d9ce4c0bd3a6fcfee7177b1fec0b2359e8e", "nats-py==2.16.0"]
 
 [project.urls]
 Homepage = "https://github.com/jim-lewis-dev/hint"
@@ -29,6 +29,9 @@ py-modules = [
   "hint_playback",
   "hint_network",
   "hint_completion",
+  "hint_runtime",
+  "hint_popup",
+  "hint_ready",
 ]
 
 [tool.setuptools.data-files]
