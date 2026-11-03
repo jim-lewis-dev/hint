@@ -62,6 +62,7 @@ def main(argv=None):
         window.connect("key-press-event", key_pressed)
         window.fullscreen()
         window.show_all()
+        close.grab_focus()
         Gtk.main()
         return 0
     except (ImportError, ValueError, OSError, RuntimeError) as exc:

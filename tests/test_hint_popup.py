@@ -89,8 +89,10 @@ import hint_popup
 def check_window():
     # Only import Gtk after the actual popup has initialized its bindings.
     from gi.repository import Gtk
+    labels = []
     def texts(widget):
         if isinstance(widget, Gtk.Label):
+            labels.append(widget)
             yield widget.get_text()
         if isinstance(widget, Gtk.TextView):
             buffer = widget.get_buffer()
@@ -102,6 +104,15 @@ def check_window():
         windows = [window for window in Gtk.Window.list_toplevels() if window.get_visible()]
         assert len(windows) == 1, windows
         assert sys.argv[2] in list(texts(windows[0]))
+        focus = windows[0].get_focus()
+        assert isinstance(focus, Gtk.Button) and focus.get_label() == 'Dismiss'
+        if sys.argv[3].startswith('--text='):
+            message = next(label for label in labels if label.get_text() == sys.argv[2])
+            assert message.get_selectable()
+            message.grab_focus()
+            assert windows[0].get_focus() == message
+            message.select_region(0, -1)
+            assert message.get_selection_bounds()[-2:] == (0, len(sys.argv[2]))
         print('HINT window displayed', flush=True)
         windows[0].destroy()
     finally:
