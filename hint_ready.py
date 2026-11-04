@@ -25,10 +25,10 @@ DESKTOP_VARIABLES = ('DISPLAY', 'WAYLAND_DISPLAY', 'XAUTHORITY',
                      'DBUS_SESSION_BUS_ADDRESS', 'XDG_SESSION_TYPE')
 
 
-def _run(argv, *, capture=False, check=True, cwd=None, timeout=60, env=None):
+def _run(argv, *, capture=False, check=True, cwd=None, timeout=60, env=None, input=None):
     result = subprocess.run([str(arg) for arg in argv], cwd=cwd, env=env, text=True,
                             stdout=subprocess.PIPE if capture else None,
-                            stderr=subprocess.PIPE if capture else None, timeout=timeout)
+                            stderr=subprocess.PIPE if capture else None, timeout=timeout, input=input)
     if check and result.returncode:
         reason = ((result.stderr or result.stdout or '').strip() if capture else '')
         raise ReadyError(reason or f'{Path(str(argv[0])).name} exited with code {result.returncode}')
@@ -131,7 +131,6 @@ def _check_ownership(paths):
 
 def _configuration(paths, args, prepared=None):
     from hint_config import DEFAULTS, validate_config
-    from hint_signals import validate
     if paths.config.exists():
         configuration = json.loads(paths.config.read_text())
         current_server = validate_config(configuration)['nats_server']
@@ -153,9 +152,24 @@ def _configuration(paths, args, prepared=None):
     table = json.loads(paths.signals.read_text()) if paths.signals.exists() else {}
     if not isinstance(table, dict):
         raise ReadyError('signals.json must contain a JSON object')
-    for name, entry in table.items():
-        validate(name, entry)
     return configuration, table
+
+
+def _validate_signals(python, table):
+    # The system interpreter may lack the timezone backport on first install.
+    # Validate with the prepared application environment before activation.
+    script = (
+        'import json,sys\n'
+        'from hint_signals import validate\n'
+        'from hint_config import HintError\n'
+        'try:\n'
+        '    for name, entry in json.load(sys.stdin).items():\n'
+        '        validate(name, entry)\n'
+        'except (HintError, ValueError, TypeError) as error:\n'
+        '    print(str(error), file=sys.stderr)\n'
+        '    raise SystemExit(1)\n'
+    )
+    _run([python, '-I', '-c', script], capture=True, input=json.dumps(table), timeout=10)
 
 
 def _create_json(path, value):
@@ -372,6 +386,7 @@ def install(source, args, paths=None):
             _run(['python3', '-m', 'venv', stage], timeout=120)
             _run([python, '-m', 'pip', 'install', source], timeout=600)
             _run([python, '-m', 'pip', 'check'], timeout=30)
+            _validate_signals(python, table)
             _run([stage / 'bin/hint', '--help'], capture=True, timeout=10)
             _run([python, '-I', '-c', 'import hint, hint_runtime, hint_playback, hint_network, hint_completion'], timeout=10)
             _run(['/usr/bin/python3', '-c', "import gi; gi.require_version('Gtk', '3.0'); from gi.repository import Gtk"], timeout=10)
@@ -391,6 +406,7 @@ def install(source, args, paths=None):
                     raise ReadyError(f'Update available. Finish or stop {count} active runs, then run hint --ready again.'
                                      if count else 'Another HINT update is already in progress.')
             configuration, table = _configuration(paths, args, prepared=configuration)
+            _validate_signals(python, table)
             for parent in (paths.command.parent, paths.service.parent, paths.completion.parent, paths.autostart.parent):
                 parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             _create_json(paths.config, configuration)
@@ -516,7 +532,8 @@ def ready(source, args, paths=None):
     installed_revision = marker.read_text().strip() if marker.is_file() else None
     if before == after and installed_revision == after and not args.enable_wake:
         if args.server is not None or args.local:
-            _configuration(paths, args)
+            configuration, table = _configuration(paths, args)
+            _validate_signals(paths.environment / 'bin/python', table)
         print('HINT is already up to date.')
         _replace_link(paths.app / 'source', source)
         _service('enable', 'hint.service')
@@ -591,6 +608,8 @@ def main(argv=None):
     parser.add_argument('--enable-wake', action='store_true')
     args = parser.parse_args(argv)
     try:
+        if sys.version_info < (3, 8):
+            raise ReadyError('HINT requires Python 3.8 or newer.')
         if os.geteuid() == 0:
             raise ReadyError('Run this as your normal desktop user, without sudo.')
         paths = Paths.current()

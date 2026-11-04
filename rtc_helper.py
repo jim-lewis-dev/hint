@@ -2,6 +2,8 @@
 # HINT managed RTC helper
 """Restricted privileged RTC operation used by HINT."""
 
+from __future__ import annotations
+
 import subprocess
 import sys
 

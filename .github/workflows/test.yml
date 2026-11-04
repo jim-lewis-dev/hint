@@ -4,11 +4,11 @@ on:
   pull_request:
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
-        python: ['3.10', '3.12', '3.14']
+        python: ['3.8', '3.10', '3.12', '3.14']
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -21,9 +21,46 @@ jobs:
           REQUIRE_NATS_SERVER: '1'
           REQUIRE_LOCAL_IPC: '1'
           REQUIRE_GTK_TESTS: '1'
+          REQUIRE_GTK4_TESTS: '1'
       - run: python -m pip wheel --no-deps --wheel-dir dist .
       - name: Verify installed messaging dependencies outside checkout
         working-directory: ${{ runner.temp }}
         run: |
           python -m pip check
           python -c 'import agent_messenger, nats_transport; print(agent_messenger.__file__); print(nats_transport.__file__)'
+
+  ubuntu-20-04:
+    runs-on: ubuntu-24.04
+    container: ubuntu:20.04
+    env:
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - name: Install Ubuntu 20.04 system dependencies
+        run: |
+          apt-get update
+          apt-get install -y ca-certificates curl git python3-venv python3-gi gir1.2-gtk-3.0 mpv xvfb xauth tzdata
+      - uses: actions/checkout@v4
+      - name: Install the NATS test broker
+        # Focal has no nats-server package. Use the same broker release as Noble.
+        run: |
+          curl --fail --location --retry 3 --output /tmp/nats-server.tar.gz https://github.com/nats-io/nats-server/releases/download/v2.10.7/nats-server-v2.10.7-linux-amd64.tar.gz
+          printf '%s  %s\n' 91f5b493ce3151baa0b15d8bf093279dc94106dd56a201704a20de567607bcf7 /tmp/nats-server.tar.gz | sha256sum --check
+          tar -xzf /tmp/nats-server.tar.gz -C /tmp
+          install -m 755 /tmp/nats-server-v2.10.7-linux-amd64/nats-server /usr/local/bin/nats-server
+      - name: Install with the stock Python 3.8
+        run: |
+          python3 -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/python -m pip install .
+      - name: Test local service, live NATS, and GTK 3
+        run: xvfb-run -a .venv/bin/python -m unittest discover -s tests -v
+        env:
+          REQUIRE_NATS_SERVER: '1'
+          REQUIRE_LOCAL_IPC: '1'
+          REQUIRE_GTK_TESTS: '1'
+      - name: Build package and verify installed dependencies
+        run: |
+          .venv/bin/python -m pip wheel --no-deps --wheel-dir dist .
+          .venv/bin/python -m pip check
+          cd /tmp
+          "$GITHUB_WORKSPACE/.venv/bin/python" -c 'import agent_messenger, nats_transport; print(agent_messenger.__file__); print(nats_transport.__file__)'

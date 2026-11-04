@@ -58,7 +58,8 @@ def _recipient(host: str) -> str:
 
 
 def _timeout_message(arguments: dict) -> str:
-    host = arguments.get("recipient", "remote computer").removeprefix("hint_server_")
+    host = arguments.get("recipient", "remote computer")
+    host = host[len("hint_server_"):] if host.startswith("hint_server_") else host
     argv = arguments.get("argv", [])
     operation = argv[0].partition("=")[0] if argv else ""
     if operation in {"--get", "--list", "--status"}:
@@ -147,7 +148,7 @@ def remote(recipient: str, argv: list[str], *, timeout: float | None = None) -> 
                        or (operation == "--set" and "--set requires --action" in message)
                        or (operation == "--fire" and "--fire" in message and "expected one argument" in message))
         if unsupported:
-            operation = operation.removeprefix("--") or "this operation"
+            operation = (operation[2:] if operation.startswith("--") else operation) or "this operation"
             host = recipient
             message = f"'{host}' does not support {operation}. Run hint --ready on that computer."
         value = {**value, "error": message}
@@ -159,10 +160,10 @@ def discover(*, timeout: float | None = None) -> list[str]:
     value = _run_client("discover", timeout=timeout)
     if not isinstance(value, list) or any(
         not isinstance(name, str) or not name.startswith("hint_server_")
-        or not _hint().NAME.fullmatch(name.removeprefix("hint_server_")) for name in value
+        or not _hint().NAME.fullmatch(name[len("hint_server_"):]) for name in value
     ):
         raise _error("invalid HINT discovery response")
-    return sorted({name.removeprefix("hint_server_") for name in value})
+    return sorted({name[len("hint_server_"):] for name in value})
 
 
 def _emit(value: dict) -> None:

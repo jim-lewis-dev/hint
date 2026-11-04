@@ -16,7 +16,10 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+try:
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+except ImportError:
+    from backports.zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from hint_config import (
     TABLE, LOCK, NAME, TIME_FORMAT, RTC_HELPER, HintError, config, read_json, sanitize_error,
@@ -91,7 +94,7 @@ def local_zone():
     """Read the receiving computer's timezone, including its future DST rules."""
     setting = os.environ.get("TZ")
     if setting:
-        setting = setting.removeprefix(":")
+        setting = setting[1:] if setting.startswith(":") else setting
         try:
             return ZoneInfo(setting)
         except (ZoneInfoNotFoundError, ValueError):

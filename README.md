@@ -20,7 +20,7 @@ no JetStream or offline message queue. Local use needs no NATS broker.
 
 ## Install once on each computer
 
-HINT targets Ubuntu 22.04 or newer, Python 3.10 or newer, Bash, and a systemd
+HINT targets Ubuntu 20.04 or newer, Python 3.8 or newer, Bash, and a systemd
 user session. Open a terminal in your desktop and run as your normal user:
 
 ```bash
@@ -46,6 +46,8 @@ For a computer that needs no remote communication, use `./hint --ready --local`.
 Setup installs HINT and its Python dependencies, MPV, desktop-opening tools,
 GTK, Bash completion, and a background user service. System package
 installation may request sudo; do not run the whole command with sudo.
+Ubuntu 20.04 uses its existing Python 3.8; setup installs timezone support
+inside HINT's own environment without replacing the system Python.
 The NATS broker itself is separate: use an existing broker or configure one
 before testing remote operations. You need one reachable broker, not a broker
 on every computer.
@@ -403,10 +405,15 @@ and keeps your settings and saved definitions.
 
 ## Development
 
+Install a `nats-server` binary for the live network tests. Ubuntu 24.04 provides
+it with `sudo apt-get install nats-server`; on older Ubuntu releases, use an
+[official NATS server release](https://github.com/nats-io/nats-server/releases).
+The application itself can use a broker on another computer.
+
 ```bash
 python3 -m venv .venv
+.venv/bin/python -m pip install --upgrade pip
 .venv/bin/python -m pip install -e .
-sudo apt-get install nats-server
 REQUIRE_NATS_SERVER=1 REQUIRE_LOCAL_IPC=1 .venv/bin/python -m unittest discover -s tests -v
 ```
 
@@ -415,6 +422,11 @@ substitutes, and a loopback NATS broker. Privileged installer operations are
 stubbed. Without `nats-server`, live network tests skip unless
 `REQUIRE_NATS_SERVER=1` is set. Real display/audio and hardware wake behavior
 still need the [target-computer checks](docs/actions.md).
+
+CI covers Python 3.8, 3.10, 3.12, and 3.14, plus Ubuntu 20.04's stock Python
+and GTK packages. The modern Ubuntu jobs also test popup startup with both
+GTK 3 and GTK 4 installed. These checks do not prove that a particular
+computer's audio, desktop session, or firmware wake support works.
 
 HINT depends on Agent Messenger, which installs NATS transport and `nats-py`.
 It contains no copied implementations of those libraries. Dependency changes

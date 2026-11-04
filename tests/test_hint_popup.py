@@ -1,4 +1,4 @@
-"""Check display initialization when both GTK/GDK generations are installed."""
+"""Check native display initialization, including with GTK/GDK 4 installed."""
 from contextlib import redirect_stderr
 import io
 import os
@@ -70,9 +70,11 @@ class GtkPopupTests(unittest.TestCase):
             raise RuntimeError("GTK window test needs distro Python")
         # Probe in a separate process: preloading GTK here would hide the
         # incompatible GDK import that caused the popup startup failure.
+        gdk_version = "4.0" if os.environ.get("REQUIRE_GTK4_TESTS") == "1" else "3.0"
         probe = subprocess.run([
             cls.python, "-c",
-            "import gi; gi.require_version('Gtk', '3.0'); gi.require_version('Gdk', '4.0')"
+            "import sys, gi; gi.require_version('Gtk', '3.0'); gi.require_version('Gdk', sys.argv[1])",
+            gdk_version
         ], capture_output=True, text=True, timeout=10)
         if probe.returncode:
             raise AssertionError(probe.stderr)

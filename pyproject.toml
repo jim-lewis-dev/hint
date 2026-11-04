@@ -1,17 +1,17 @@
 [build-system]
-requires = ["setuptools>=77"]
-build-backend = "setuptools.build_meta"
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
 
 [project]
 name = "human-interrupt"
 version = "0.1.6"
 description = "Launch reminders, media, messages and commands locally, remotely or on a schedule"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.8"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{name = "Jim Lewis"}]
-dependencies = ["agent-messenger @ git+https://github.com/jim-lewis-dev/agent_messenger.git@fdfa9d9ce4c0bd3a6fcfee7177b1fec0b2359e8e", "nats-py==2.16.0"]
+dependencies = ["agent-messenger @ git+https://github.com/jim-lewis-dev/agent_messenger.git@7d1ff7976659b323a8c2728b91f0bee2b6e0cf44", "nats-py==2.16.0", "backports.zoneinfo>=0.2.1; python_version < '3.9'"]
 
 [project.urls]
 Homepage = "https://github.com/jim-lewis-dev/hint"
@@ -21,18 +21,32 @@ Issues = "https://github.com/jim-lewis-dev/hint/issues"
 [project.scripts]
 hint = "hint:main"
 
-[tool.setuptools]
-py-modules = [
-  "hint",
-  "hint_config",
-  "hint_signals",
-  "hint_playback",
-  "hint_network",
-  "hint_completion",
-  "hint_runtime",
-  "hint_popup",
-  "hint_ready",
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+only-include = [
+  "hint.py",
+  "hint_config.py",
+  "hint_signals.py",
+  "hint_playback.py",
+  "hint_network.py",
+  "hint_completion.py",
+  "hint_runtime.py",
+  "hint_popup.py",
+  "hint_ready.py",
 ]
 
-[tool.setuptools.data-files]
-"share/hint" = ["completions/hint.bash", "hint.service", "rtc_helper.py", "config.example.json"]
+[tool.hatch.build.targets.wheel.shared-data]
+"completions/hint.bash" = "share/hint/hint.bash"
+"hint.service" = "share/hint/hint.service"
+"rtc_helper.py" = "share/hint/rtc_helper.py"
+"config.example.json" = "share/hint/config.example.json"
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/hint", "/hint*.py", "/rtc_helper.py", "/install.sh", "/uninstall.sh",
+  "/config.example.json", "/hint.service", "/completions/*.bash",
+  "/tests/*.py", "/docs/*.md", "/.github/workflows/*.yml",
+  "/LICENSE", "/README.md", "/pyproject.toml",
+]

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import builtins
 import contextlib
 import io
 import json
@@ -50,6 +51,7 @@ class InstallTests(unittest.TestCase):
         self.stack.enter_context(patch('hint_ready.os.geteuid', return_value=1000))
         self.stack.enter_context(patch('hint_ready._run', side_effect=self.run_tool))
         self.stack.enter_context(patch('hint_ready._runtime', side_effect=self.runtime))
+        self.stack.enter_context(patch('hint_ready._validate_signals', side_effect=self.validate_signals))
         self.stack.enter_context(contextlib.redirect_stdout(self.output))
         self.stack.enter_context(contextlib.redirect_stderr(self.output))
 
@@ -94,6 +96,16 @@ class InstallTests(unittest.TestCase):
             raise ReadyError(stderr or 'test tool failed')
         return result
 
+    def validate_signals(self, python, table):
+        from hint_config import HintError
+        from hint_signals import validate
+        self.calls.append(['validate', str(python)])
+        try:
+            for name, entry in table.items():
+                validate(name, entry)
+        except HintError as error:
+            raise ReadyError(str(error)) from error
+
     def runtime(self, python, body, timeout=5, process_timeout=None):
         self.calls.append(['runtime', str(python), body['op']])
         if body['op'] == 'prepare_update':
@@ -134,6 +146,69 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(self.paths.autostart.stat().st_mode & 0o777, 0o644)
         self.assertIn('python3-gi', next(call for call in self.calls if call[:4] == ['sudo', 'apt-get', 'install', '-y']))
         self.assertFalse(any('python3-tk' in call for call in self.calls))
+
+    def test_configuration_bootstrap_does_not_import_timezone_dependencies(self):
+        self.paths.signals.parent.mkdir(parents=True)
+        saved = {'later': {'popup': 'Hello', 'time': '2031-01-01 00:00:00'}}
+        self.paths.signals.write_text(json.dumps(saved))
+        original_import = builtins.__import__
+
+        def without_timezone(name, *args, **kwargs):
+            if name in {'hint_signals', 'zoneinfo', 'backports.zoneinfo'}:
+                raise AssertionError('bootstrap imported an application dependency')
+            return original_import(name, *args, **kwargs)
+
+        args = options()
+        args.local = True
+        with patch('builtins.__import__', side_effect=without_timezone):
+            configuration, table = hint_ready._configuration(self.paths, args)
+        self.assertIsNone(configuration['nats_server'])
+        self.assertEqual(table, saved)
+        self.assertFalse(self.paths.config.exists())
+
+    def test_signal_validation_uses_prepared_environment_after_dependencies(self):
+        self.install()
+        target = self.paths.environment.resolve() / 'bin/python'
+        pip_index = next(i for i, call in enumerate(self.calls) if call[1:4] == ['-m', 'pip', 'install'])
+        validations = [(i, call) for i, call in enumerate(self.calls) if call[0] == 'validate']
+        self.assertEqual(len(validations), 2)
+        self.assertTrue(all(i > pip_index and call[1] == str(target) for i, call in validations))
+
+    def test_invalid_saved_action_preserves_working_installation_and_retry_succeeds(self):
+        self.install()
+        old = self.paths.environment.resolve()
+        self.paths.signals.write_text('{"bad":{"popup":""}}\n')
+        self.calls.clear()
+        with self.assertRaisesRegex(ReadyError, 'must be nonempty text'):
+            self.install()
+        self.assertTrue(self.active)
+        self.assertEqual(self.paths.environment.resolve(), old)
+        self.assertNotIn(['systemctl', '--user', 'stop', 'hint.service'], self.calls)
+        self.assertEqual(len(list(self.paths.app.glob('env-*'))), 1)
+        self.paths.signals.write_text('{"good":{"popup":"Ready"}}\n')
+        self.install()
+        self.assertNotEqual(self.paths.environment.resolve(), old)
+        self.assertTrue(self.active)
+
+    def test_late_invalid_saved_action_cancels_update_before_service_stop(self):
+        self.install()
+        old = self.paths.environment.resolve()
+        self.calls.clear()
+        runtime = self.runtime
+
+        def change_during_gate(python, body, **kwargs):
+            result = runtime(python, body, **kwargs)
+            if body['op'] == 'prepare_update':
+                self.paths.signals.write_text('{"bad":{"popup":""}}\n')
+            return result
+
+        with patch('hint_ready._runtime', side_effect=change_during_gate), \
+                self.assertRaisesRegex(ReadyError, 'must be nonempty text'):
+            self.install()
+        self.assertTrue(self.active)
+        self.assertEqual(self.paths.environment.resolve(), old)
+        self.assertNotIn(['systemctl', '--user', 'stop', 'hint.service'], self.calls)
+        self.assertTrue(any(call[-1] == 'cancel_update' for call in self.calls))
 
     def test_update_prepares_before_stop_preserves_data_and_removes_old_environment(self):
         self.install()
