@@ -32,7 +32,7 @@ class OnceAction(argparse.Action):
 
 class RemoteAction(OnceAction):
     def __call__(self, parser, namespace, values, option_string=None):
-        if not NAME.fullmatch(values or ""):
+        if values is not True and not NAME.fullmatch(values or ""):
             raise HintError("Invalid hostname: use letters, digits, '_' or '-'.")
         super().__call__(parser, namespace, values, option_string)
 
@@ -41,7 +41,8 @@ def parser(*, remote_command=False) -> argparse.ArgumentParser:
     p = CommandParser(
         prog="hint", description="HINT — Human INTerrupt. An alarm clock with unreasonable ambition.",
         epilog="Examples:\n  hint --set stretch --popup 'Time to stretch!'\n"
-               "  hint --fire stretch --remote dirtsy\n"
+               "  hint --fire stretch --remote beacon\n"
+               "  hint --list --remote\n"
                "  hint --fire --popup 'Dinner is ready!'\n"
                "  hint --set stretch --time '2027-02-10 09:00'\n"
                "  hint --status\n  hint --ready",
@@ -83,11 +84,11 @@ def parser(*, remote_command=False) -> argparse.ArgumentParser:
                          help="URL, existing file/directory, or /bin/sh command")
     content.add_argument("--popup", metavar="TEXT", action=OnceAction,
                          help="show literal text in HINT's own fullscreen window")
-    p.add_argument("--remote", metavar="HOST", action=RemoteAction,
-                   help="operate on another HINT computer by hostname")
+    p.add_argument("--remote", nargs="?", const=True, metavar="HOST", action=RemoteAction,
+                   help="target HOST; with --list, omit HOST to include all responding computers")
     setup = p.add_mutually_exclusive_group()
-    setup.add_argument("--server", metavar="URL", action=OnceAction,
-                       help="initial --ready setup: NATS server URL")
+    setup.add_argument("--server", metavar="ADDRESS", action=OnceAction,
+                       help="initial --ready setup: NATS hostname, IP[:port], or URL")
     setup.add_argument("--local", nargs=0, const=True, default=False, action=OnceAction,
                        help="initial --ready setup: local-only operation")
     p.add_argument("--enable-wake", nargs=0, const=True, default=False, action=OnceAction,
@@ -96,6 +97,8 @@ def parser(*, remote_command=False) -> argparse.ArgumentParser:
 
 
 def validate_args(args) -> None:
+    if args.remote is True and not args.list:
+        raise HintError("Supply a hostname after --remote; only --list can use --remote without a hostname.")
     for value in (args.set_name, args.fire, args.get, args.remove, args.pause, args.resume,
                   args.stop, args.status):
         if value not in (None, "") and not NAME.fullmatch(value):
@@ -169,6 +172,9 @@ def _offline_status(name=None):
 
 
 def execute(args):
+    if args.remote is True:
+        from hint_network import list_all
+        return list_all()
     if args.remote:
         from hint_network import remote
         return remote(args.remote, operation_args(args))
@@ -276,6 +282,11 @@ def _definitions(value, *, remote=False, display_times=None) -> str:
 
 
 def render(result, args) -> str:
+    if args.list and args.remote is True:
+        return "\n\n".join(
+            _plain(host) + "\n" + _definitions(value["definitions"], remote=host != result["local_host"])
+            for host, value in sorted(result["hosts"].items()) if "definitions" in value
+        )
     host = args.remote or socket.gethostname()
     prefix = _plain(host) + ": "
     if isinstance(result, dict) and isinstance(result.get("error"), str):
@@ -436,16 +447,31 @@ def main(argv: list[str] | None = None) -> int:
                 options.append("--enable-wake")
             return ready(options)
         result = execute(args)
+        if args.list and args.remote is True:
+            output = render(result, args)
+            if output:
+                print(output)
+            failures = [f"{_plain(host)}: {_plain(sanitize_error(value['error']))}"
+                        for host, value in sorted(result["hosts"].items()) if "error" in value]
+            if result.get("discovery_error"):
+                failures.append("Discovery: " + _plain(sanitize_error(result["discovery_error"])))
+            for message in failures:
+                print(message, file=sys.stderr)
+            return 1 if failures else 0
         failed = isinstance(result, dict) and (isinstance(result.get("error"), str) or bool(result.get("failed"))
                     or (bool(result.get("unsupported")) and not result.get("changed", result.get("count", 0))))
         print(render(result, args), file=sys.stderr if failed else sys.stdout)
         return 1 if failed else 0
     except HintError as exc:
         host = getattr(args, "remote", None) or socket.gethostname()
+        if host is True:
+            host = socket.gethostname()
         print(f"{_plain(host)}: {_plain(sanitize_error(exc))}", file=sys.stderr)
         return 2
     except Exception as exc:
         host = getattr(args, "remote", None) or socket.gethostname()
+        if host is True:
+            host = socket.gethostname()
         print(f"{_plain(host)}: Could not complete the operation: {_plain(sanitize_error(exc))}. Check status before retrying.", file=sys.stderr)
         return 1
 

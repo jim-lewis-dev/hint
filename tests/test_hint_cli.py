@@ -191,7 +191,7 @@ class CliTests(unittest.TestCase):
 
     def test_help_and_empty_command_show_current_interface(self):
         result = subprocess.run([sys.executable,'-m','hint','--help'],capture_output=True,text=True,check=True)
-        for option in ('--remote HOST','--ready','--pause','--no-time','--no-wake','--popup TEXT'):
+        for option in ('--remote [HOST]','--ready','--pause','--no-time','--no-wake','--popup TEXT'):
             self.assertIn(option,result.stdout)
         self.assertNotIn('popup:TEXT', result.stdout)
         self.assertNotIn('--handler',result.stdout)

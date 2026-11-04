@@ -109,7 +109,7 @@ def complete(words: list[str], cword: int) -> list[str]:
         prefix = value
     elif pending and prefix == "=":
         prefix = ""
-    if pending in OPTIONAL_VALUES and prefix.startswith("--") and not attached:
+    if (pending in OPTIONAL_VALUES or pending == "--remote") and prefix.startswith("--") and not attached:
         pending = None
     if pending == "--remote":
         if used & {"--discover", "--ready"}:
@@ -159,6 +159,8 @@ def complete(words: list[str], cword: int) -> list[str]:
             candidates = [c for c in candidates if c not in OPERATIONS]
         if remote_present:
             candidates = [c for c in candidates if c not in {"--discover", "--ready"}]
+            if remote is None and not used & OPERATIONS:
+                candidates = [c for c in candidates if c in {"--list", "--help"}]
         if used & {"--discover", "--ready"}:
             candidates = [c for c in candidates if c != "--remote"]
         if "--ready" not in used:

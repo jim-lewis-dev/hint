@@ -1,5 +1,8 @@
 # HINT — Human INTerrupt
 
+[![Tests](https://github.com/jim-lewis-dev/hint/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/jim-lewis-dev/hint/actions/workflows/test.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 **An alarm clock with unreasonable ambition.**
 
 Launch reminders, media, messages, and commands—locally, remotely, or on a
@@ -18,12 +21,17 @@ Core NATS through [Agent Messenger](https://github.com/jim-lewis-dev/agent_messe
 and [NATS transport](https://github.com/jim-lewis-dev/nats_transport). There is
 no JetStream or offline message queue. Local use needs no NATS broker.
 
+[Install](#install-once-on-each-computer) · [Examples](#ready-set-fire) ·
+[Remote use](#remote-use) · [Actions](#actions-and-controls) ·
+[Settings](#configuration-and-files) · [Troubleshooting](#troubleshooting-and-removal)
+
 ## Install once on each computer
 
 HINT targets Ubuntu 20.04 or newer, Python 3.8 or newer, Bash, and a systemd
 user session. Open a terminal in your desktop and run as your normal user:
 
 ```bash
+sudo apt-get update
 sudo apt-get install -y git
 mkdir -p "$HOME/projects"
 git clone https://github.com/jim-lewis-dev/hint.git "$HOME/projects/hint"
@@ -31,26 +39,41 @@ cd "$HOME/projects/hint"
 ./hint --ready
 ```
 
-The first setup asks once for a NATS server URL or local-only operation. You
-can supply the choice directly:
+When no saved configuration exists, setup asks for a NATS server hostname,
+IP address, or URL—or `local` for this computer only. You must choose
+explicitly; empty input does not silently select a server. Updates reuse
+your saved choice.
+
+You can supply the choice directly. Without an interactive terminal, setup
+requires `--server` or `--local`:
 
 ```bash
-./hint --ready --server nats://server:4222
+./hint --ready --server server
 ```
 
 Replace `server` with your broker's hostname or IP address. Use the same
 reachable broker on participating computers. `127.0.0.1` always means the
 computer running HINT; it does not identify a broker on another computer.
 For a computer that needs no remote communication, use `./hint --ready --local`.
+Bare addresses use `nats://` and port 4222. Supply `server:PORT` for another
+port, or a full `nats://` or `tls://` URL for credentials or TLS. IPv6 addresses
+require a full bracketed URL, such as `nats://[::1]:4222`.
 
 Setup installs HINT and its Python dependencies, MPV, desktop-opening tools,
 GTK, Bash completion, and a background user service. System package
 installation may request sudo; do not run the whole command with sudo.
 Ubuntu 20.04 uses its existing Python 3.8; setup installs timezone support
 inside HINT's own environment without replacing the system Python.
-The NATS broker itself is separate: use an existing broker or configure one
-before testing remote operations. You need one reachable broker, not a broker
-on every computer.
+The NATS broker itself is separate: use an existing broker or follow the
+[NATS getting-started guide](https://docs.nats.io/concepts/getting-started/)
+before testing remote operations. HINT uses Core NATS; enabling JetStream is
+unnecessary.
+
+For several computers, choose one reliably available broker and use its URL
+on every computer. Use a hostname that all of them can resolve, or reserve the
+broker's IP address in your router's DHCP settings so it stays stable.
+`hint --discover` finds HINT computers through that broker; it does not scan
+your network for NATS servers or choose one automatically.
 
 HINT starts immediately and automatically with your user session on later
 logins. After suspend, it continues with that session. Displaying windows
@@ -111,6 +134,7 @@ removing the schedule. Neither command stops an active run.
 | `hint --set NAME --wake` / `--no-wake` | Enable or disable its wake preference |
 | `hint --get NAME` | Show one saved definition |
 | `hint --list` | Show all saved definitions |
+| `hint --list --remote` | Show local and discovered computers' definitions, grouped by hostname |
 | `hint --fire NAME` | Launch another run of a saved action |
 | `hint --fire --action STRING` | Launch an action without saving a definition |
 | `hint --fire --popup TEXT` | Display a popup without saving a definition |
@@ -168,6 +192,20 @@ Replace `beacon` with a hostname returned by discovery. Every installed computer
 can send and receive. The receiver must be awake, connected, and running HINT.
 You can type a known hostname directly even if discovery did not list it.
 `--ready` prepares the local computer; it does not remotely upgrade peers.
+All participating computers must already be configured to use the same broker.
+
+To see saved actions across your computers in one command:
+
+```bash
+hint --list --remote
+```
+
+`hint --remote --list` does the same thing. The result includes this computer
+and responding peers, grouped by hostname. It cannot include offline computers
+that discovery cannot find. If discovery or an individual peer fails, HINT
+keeps the available results, reports the error, and exits with a nonzero status.
+Only `--list` accepts `--remote` without a hostname; firing or changing actions
+always requires a specific receiver.
 
 Paths, command execution, and scheduled times belong to the **receiving
 computer**. For example, `'~/Music/a song.mp3'` refers to its user's music
@@ -184,7 +222,8 @@ retry mutating requests.
 
 Remote commands run as the receiving desktop user. Use a broker accessible only
 to trusted users and computers, with appropriate NATS authentication and network
-controls. Configure broker listening, authentication, and the client port
+controls: a client permitted to send HINT requests can launch commands on the
+receiving computer. Configure broker listening, authentication, and the client port
 (normally 4222) separately. Credentials belong in the private configuration,
 not in the repository. A NATS URL can contain percent-encoded credentials;
 `tls://HOST:PORT` uses the client's TLS trust configuration.
@@ -198,8 +237,19 @@ sudo ufw allow proto tcp from 192.168.1.0/24 to any port 4222
 
 Replace `192.168.1.0/24` with your LAN subnet and use the configured NATS port.
 A rule allowing only one client IP will block your other computers. This rule
-does not configure NATS authentication or router port forwarding. VPN settings
-on the broker must also permit LAN traffic.
+does not configure NATS authentication or router port forwarding.
+
+VPNs on **every participating computer**, including the broker, must permit
+LAN traffic. For NordVPN on Linux, check `nordvpn settings`; on your trusted
+LAN, enable LAN discovery if it is disabled:
+
+```bash
+nordvpn set lan-discovery enable
+```
+
+This permits local-network traffic while the VPN stays connected. See
+[NordVPN's LAN settings](https://support.nordvpn.com/hc/en-us/articles/20196094470929-How-to-install-the-NordVPN-app-on-Linux-distributions).
+HINT's installer does not change your firewall, VPN, or router settings.
 
 ## Actions and controls
 
@@ -247,6 +297,8 @@ X11 and Wayland desktops are supported through the chosen applications.
 HINT's own GTK text windows support both display protocols.
 Desktop integration, installed viewers, and graphics/audio drivers vary;
 verify the [practical checks](docs/actions.md) on each target computer.
+Raspberry Pi OS and other non-Ubuntu installations need separate validation;
+this installer is designed around Ubuntu's packages and user services.
 
 For a command with redirects or arguments, quote the whole action once:
 
@@ -350,13 +402,25 @@ recent history; restarting it clears that history and stops its controlled
 runs. Untracked external windows may remain open. A graphical-login entry refreshes
 the service with the current display session without restarting active runs.
 
-The default settings are in [config.example.json](config.example.json).
-Set `nats_server` to a full NATS URL, or JSON `null` for local-only operation.
-On an existing installation, edit that file to change the broker, then restart:
+Your live settings are in **`~/.config/hint/config.json`**. To change the
+broker, edit the `nats_server` entry in that private file, keeping its other
+settings. For example:
+
+```json
+"nats_server": "nats://192.168.1.10:4222"
+```
+
+Use your broker's address, or JSON `null` for local-only operation. Then restart
+the service; this ends its active runs:
 
 ```bash
 systemctl --user restart hint.service
 ```
+
+[config.example.json](config.example.json) documents the available settings.
+Editing that example or the source file `hint_config.py` does not change the
+installed service's saved configuration. Setup flags choose the initial
+configuration; later `--ready` updates preserve it.
 
 `request_timeout_seconds` bounds a remote operation. Discovery uses its response
 collection window plus a short connection/cleanup allowance. Timeouts must be
@@ -387,18 +451,33 @@ source "${XDG_DATA_HOME:-$HOME/.local/share}/bash-completion/completions/hint"
 
 ## Troubleshooting and removal
 
-```bash
-hint --status
-systemctl --user status hint.service --no-pager
-journalctl --user -u hint.service -n 30 --no-pager
-```
+For a remote connection failure, check these in order:
+
+1. **Saved settings:** confirm `nats_server` in `~/.config/hint/config.json`
+   points to the intended broker. `127.0.0.1` means this computer.
+2. **TCP reachability:** on the failing computer, test the broker's host and
+   port. Replace the example address below with yours:
+
+   ```bash
+   python3 -c 'import socket; socket.create_connection(("192.168.1.10", 4222), timeout=3).close(); print("TCP connection succeeded")'
+   ```
+
+   A timeout or refusal requires checking the broker, route, firewall, and VPN
+   LAN settings. Reinstalling HINT does not repair a blocked TCP connection.
+   A successful connection confirms reachability, not NATS authentication or TLS.
+3. **Service diagnostics:** inspect HINT's status and journal on the affected
+   computer for connection, authentication, or action errors:
+
+   ```bash
+   hint --status
+   systemctl --user status hint.service --no-pager
+   journalctl --user -u hint.service -b -n 30 --no-pager
+   ```
 
 The journal is the existing system service log. It holds launch diagnostics and
 errors, including a shell command's later failure. You do not need to watch it
-during normal use. If remote operations fail, check the recipient's service,
-the broker URL, authentication, firewall, and VPN LAN settings. If a fire is
-acknowledged but nothing appears, check the receiver's status and journal,
-its action path, and its desktop session.
+during normal use. If a fire is acknowledged but nothing appears, check the
+receiver's status and journal, its action path, and its desktop session.
 
 From the project directory, `./uninstall.sh` removes the managed installation
 and keeps your settings and saved definitions.
@@ -423,10 +502,11 @@ stubbed. Without `nats-server`, live network tests skip unless
 `REQUIRE_NATS_SERVER=1` is set. Real display/audio and hardware wake behavior
 still need the [target-computer checks](docs/actions.md).
 
-CI covers Python 3.8, 3.10, 3.12, and 3.14, plus Ubuntu 20.04's stock Python
-and GTK packages. The modern Ubuntu jobs also test popup startup with both
-GTK 3 and GTK 4 installed. These checks do not prove that a particular
-computer's audio, desktop session, or firmware wake support works.
+The [test workflow](https://github.com/jim-lewis-dev/hint/actions/workflows/test.yml)
+runs Python 3.8, 3.10, 3.12, and 3.14, plus Ubuntu 20.04's stock Python and GTK
+packages. The modern Ubuntu jobs also test popup startup with both GTK 3 and
+GTK 4 installed. These checks do not prove that a particular computer's audio,
+desktop session, or firmware wake support works.
 
 HINT depends on Agent Messenger, which installs NATS transport and `nats-py`.
 It contains no copied implementations of those libraries. Dependency changes

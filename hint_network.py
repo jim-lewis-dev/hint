@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import select
@@ -164,6 +165,54 @@ def discover(*, timeout: float | None = None) -> list[str]:
     ):
         raise _error("invalid HINT discovery response")
     return sorted({name[len("hint_server_"):] for name in value})
+
+
+def _listing(value: object) -> dict:
+    """Isolate one bad peer without interpreting its schedule in our timezone."""
+    if isinstance(value, dict) and isinstance(value.get("error"), str):
+        return {"error": _safe(value["error"])}
+    if not isinstance(value, dict) or any(
+        not isinstance(name, str) or not _hint().NAME.fullmatch(name)
+        or not isinstance(entry, dict)
+        or ("action" in entry) == ("popup" in entry)
+        or not isinstance(entry.get("popup", entry.get("action")), str)
+        or ("time" in entry and not isinstance(entry["time"], str))
+        for name, entry in value.items()
+    ):
+        return {"error": "Invalid saved-action list from the HINT computer."}
+    return {"definitions": value}
+
+
+def list_all() -> dict:
+    """List locally and on discovered peers; no command is broadcast or retried."""
+    local = hostname()
+    result = {"local_host": local, "hosts": {}}
+    try:
+        result["hosts"][local] = _listing(_hint().list_signals())
+    except Exception as error:
+        result["hosts"][local] = {"error": _safe(error)}
+    try:
+        configuration = _configured()
+        peers = sorted(set(discover()) - {local})
+    except Exception as error:
+        result["discovery_error"] = _safe(error)
+        return result
+    if not peers:
+        return result
+    deadline = time.monotonic() + float(configuration.get("request_timeout_seconds", 10))
+
+    def read_peer(host):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return host, {"error": "The shared listing deadline expired before this computer could be queried."}
+        try:
+            return host, _listing(remote(host, ["--list"], timeout=remaining))
+        except Exception as error:
+            return host, {"error": _safe(error)}
+
+    with ThreadPoolExecutor(max_workers=min(8, len(peers))) as executor:
+        result["hosts"].update(executor.map(read_peer, peers))
+    return result
 
 
 def _emit(value: dict) -> None:

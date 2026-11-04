@@ -497,7 +497,7 @@ class _ControlHandler(socketserver.StreamRequestHandler):
             if len(raw) > MAX_MESSAGE:
                 raw = b'{"ok":false,"error":"HINT response is too large."}\n'
             self.wfile.write(raw)
-        except (BrokenPipeError, ConnectionError, TimeoutError):
+        except (BrokenPipeError, ConnectionError, TimeoutError, socket.timeout):
             pass
 
 
@@ -612,7 +612,7 @@ def request(body: dict, timeout=10, *, path=None) -> dict:
         return value
     except (FileNotFoundError, ConnectionRefusedError):
         raise HintError("HINT service is not running. Run hint --ready.") from None
-    except (TimeoutError, ConnectionError, BrokenPipeError):
+    except (TimeoutError, socket.timeout, ConnectionError, BrokenPipeError):
         if sent and body.get("op") not in {"status"}:
             raise HintError("No reply from the HINT service. The request may have taken effect; it was not retried.") from None
         raise HintError("No reply from the HINT service. Run hint --ready.") from None

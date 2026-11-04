@@ -238,6 +238,13 @@ whether it was local, remote, or scheduled.
 8. Repeat in the opposite direction, then test a remotely scheduled popup.
 9. Reboot/log in and verify service startup. Test suspend/wake separately.
 
+For an overview, run `hint --list --remote` or `hint --remote --list`. Verify
+that definitions appear under the correct hostnames, including this computer.
+This lists only computers found by live discovery. A discovered peer that
+stops responding should produce an error while other computers' results
+remain visible. Omitting the remote hostname is supported only for `--list`;
+it must never turn a fire, stop, or edit into a broadcast.
+
 HINT's network transport does not require the same display protocol on both
 computers. X11, Wayland, and Raspberry Pi
 desktops still need their own real display/audio and hardware wake checks.

@@ -5,16 +5,20 @@ import argparse
 from contextlib import contextmanager
 from dataclasses import dataclass
 import fcntl
+import ipaddress
 import pwd
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import socket
 import subprocess
 import sys
 import tempfile
 import time
+
+from hint_config import HintError
 
 
 class ReadyError(Exception):
@@ -129,22 +133,64 @@ def _check_ownership(paths):
         raise ReadyError(f'Cannot replace {source}: it is not owned by this HINT installation.')
 
 
+def _server_url(value):
+    """Accept simple server addresses at setup without rewriting saved URLs."""
+    value = value.strip()
+    if '://' in value:
+        return value
+    host, separator, port = value.partition(':')
+    hostname = host[:-1] if host.endswith('.') else host
+    labels = hostname.split('.')
+    valid = (len(hostname) <= 253 and all(
+        re.fullmatch(r'[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?', label)
+        for label in labels
+    ))
+    if separator:
+        valid = valid and bool(re.fullmatch(r'[0-9]{1,5}', port))
+        if valid:
+            valid = 1 <= int(port) <= 65535
+    if valid and re.fullmatch(r'[0-9.]+', host):
+        try:
+            ipaddress.IPv4Address(host)
+        except ValueError:
+            valid = False
+    if not valid:
+        raise HintError('NATS server must be a hostname or IPv4 address with optional :port, or a full nats:// or tls:// URL.')
+    return f'nats://{host}:{int(port) if separator else 4222}'
+
+
 def _configuration(paths, args, prepared=None):
     from hint_config import DEFAULTS, validate_config
+    selected_server = _server_url(args.server) if args.server is not None else None
     if paths.config.exists():
         configuration = json.loads(paths.config.read_text())
         current_server = validate_config(configuration)['nats_server']
-        if (args.server is not None or args.local) and (None if args.local else args.server) != current_server:
+        if (args.server is not None or args.local) and (None if args.local else selected_server) != current_server:
             raise ReadyError(f'Existing configuration was preserved. Edit {paths.config} to change its server.')
     elif prepared is not None:
         configuration = prepared
     else:
-        server = args.server
+        server = selected_server
         if args.local:
             server = None
         elif server is None:
-            answer = input("NATS server URL, or 'local' for this computer only: ").strip() if sys.stdin.isatty() else ''
-            server = None if answer.lower() == 'local' else answer or DEFAULTS['nats_server']
+            if not sys.stdin.isatty():
+                raise ReadyError('Choose a NATS server with --server nats://HOST:4222, or use --local for this computer only.')
+            while True:
+                try:
+                    answer = input("NATS server (hostname, IP or URL), or 'local' for this computer only: ").strip()
+                except EOFError:
+                    raise ReadyError('No server selected. Run again with --server nats://HOST:4222 or --local.') from None
+                if not answer:
+                    print("Enter a NATS server hostname, IP or URL, or 'local'.", file=sys.stderr)
+                    continue
+                try:
+                    server = None if answer.lower() == 'local' else _server_url(answer)
+                    validate_config({**DEFAULTS, 'nats_server': server})
+                except HintError as error:
+                    print(str(error), file=sys.stderr)
+                    continue
+                break
         configuration = {**DEFAULTS, 'nats_server': server}
     configuration = validate_config(configuration)
     if prepared is not None and configuration != prepared:
@@ -345,8 +391,14 @@ def _ready_message(paths, status):
     elif status.get('network') == 'connected':
         print(f'Ready on {host}.')
     else:
+        from hint_config import sanitize_error
+
         reason = status.get('network') or 'not connected'
-        print(f'Ready locally; NATS connection unavailable: {reason}.')
+        server = sanitize_error(configuration['nats_server'])
+        print(f'Ready locally on {host}; NATS connection to {server}: {reason}.')
+        print(f'Settings: {paths.config}')
+        print('Check the server address, firewall, and VPN LAN access.')
+        print('Details: journalctl --user -u hint.service -b -n 20 --no-pager')
 
 
 def install(source, args, paths=None):
@@ -624,7 +676,7 @@ def main(argv=None):
         else:
             ready(source, args, paths)
         return 0
-    except (ReadyError, OSError, ValueError, subprocess.TimeoutExpired) as error:
+    except (ReadyError, HintError, OSError, ValueError, subprocess.TimeoutExpired) as error:
         try:
             from hint_config import sanitize_error
             reason = sanitize_error(error)

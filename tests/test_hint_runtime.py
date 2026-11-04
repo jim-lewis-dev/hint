@@ -15,6 +15,27 @@ from hint_config import HintError
 from hint_runtime import RunManager, RuntimeServer, request
 
 
+class ClientTimeoutTests(unittest.TestCase):
+    def test_socket_timeouts_report_uncertainty_without_retrying_mutations(self):
+        # socket.timeout is a distinct exception on Python 3.8. Exercise it even
+        # on systems where the real Unix-socket integration test cannot run.
+        for operation in ("fire", "status"):
+            for stage in ("connect", "sendall", "recv"):
+                with self.subTest(operation=operation, stage=stage):
+                    with patch("hint_runtime.socket.socket") as factory:
+                        connection = factory.return_value.__enter__.return_value
+                        getattr(connection, stage).side_effect = socket.timeout("timed out")
+                        with self.assertRaises(HintError) as caught:
+                            request({"op": operation, "name": "stretch"}, path="unused.sock")
+                        message = str(caught.exception)
+                        self.assertIn("No reply from the HINT service.", message)
+                        ambiguous = operation == "fire" and stage != "connect"
+                        self.assertEqual("may have taken effect; it was not retried" in message, ambiguous)
+                        self.assertEqual(factory.call_count, 1)
+                        self.assertEqual(connection.connect.call_count, 1)
+                        self.assertEqual(connection.sendall.call_count, int(stage != "connect"))
+
+
 class FakeAction:
     def __init__(self, action):
         self.pid = 123

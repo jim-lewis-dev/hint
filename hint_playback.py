@@ -477,7 +477,9 @@ def _launch(action: str | None = None, *, popup: str | None = None) -> ManagedAc
             return _spawn([str(path)], detail=str(path))
         return _document(path, mime)
     try:
-        syntax = subprocess.run([SHELL, "-n", "-c", action], stdin=subprocess.DEVNULL,
+        # Older dash versions ignore -n with -c. Read stdin to check syntax
+        # without executing commands, substitutions, or redirections.
+        syntax = subprocess.run([SHELL, "-n"], input=action,
                                 capture_output=True, text=True, timeout=2)
     except subprocess.TimeoutExpired as exc:
         raise HintError("Shell syntax check timed out.") from exc

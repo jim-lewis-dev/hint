@@ -229,6 +229,41 @@ class LiveNetworkTests(unittest.TestCase):
         self.assertEqual(network.remote("test", ["--get", "missing"]), self.reply)
         self.assertEqual(self.received[-1], "hint --get missing")
 
+    def test_live_all_host_listing_uses_existing_peer_list_requests(self):
+        from agent_messenger import AgentMessenger
+        from nats_transport import NatsTransport
+        peers = []
+        local_requests = []
+        for name in ("beacon", "local"):
+            peer = AgentMessenger("hint_server_" + name, NatsTransport(self.server_url))
+            self.addCleanup(peer.close)
+            peers.append(peer)
+
+        def answer_beacon(event):
+            if event["type"] == "in_request":
+                self.assertEqual(event["payload"], "hint --list")
+                peers[0].respond(event["request_id"], json.dumps({"dinner": {"popup": "Dinner!"}}))
+
+        def answer_local(event):
+            if event["type"] == "in_request":
+                local_requests.append(event["payload"])
+                peers[1].respond(event["request_id"], "{}")
+
+        peers[0].listen(answer_beacon)
+        peers[1].listen(answer_local)
+        self.config.update(request_timeout_seconds=3, discovery_timeout_seconds=0.2)
+        with patch.object(network, "hostname", return_value="local"), \
+                patch.object(hint, "list_signals", return_value={"stretch": {"action": "true"}}):
+            result = hint.run(["--remote", "--list"])
+        self.assertNotIn("discovery_error", result)
+        self.assertEqual(result["hosts"], {
+            "local": {"definitions": {"stretch": {"action": "true"}}},
+            "test": {"definitions": self.reply},
+            "beacon": {"definitions": {"dinner": {"popup": "Dinner!"}}},
+        })
+        self.assertEqual(self.received, ["hint --list"])
+        self.assertEqual(local_requests, [])
+
     def test_live_remote_popup_text_survives_transport_without_interpretation(self):
         message = 'Dinner! "Now"\n$HOME; $(touch unexpected); --set'
         self.reply = {"fired": True, "signal": "HINT-001"}

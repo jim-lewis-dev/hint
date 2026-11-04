@@ -245,6 +245,41 @@ class InstallTests(unittest.TestCase):
         prompt.assert_called_once()
         self.assertIsNone(json.loads(self.paths.config.read_text())['nats_server'])
 
+    def test_empty_first_answer_requires_an_explicit_choice(self):
+        with patch('hint_ready.sys.stdin.isatty', return_value=True), \
+                patch('builtins.input', side_effect=['  ', 'local']) as prompt:
+            self.install(local=False)
+        self.assertEqual(prompt.call_count, 2)
+        self.assertIsNone(json.loads(self.paths.config.read_text())['nats_server'])
+        self.assertIn('Enter a NATS server hostname', self.output.getvalue())
+
+    def test_invalid_prompt_answer_can_be_corrected_before_installation(self):
+        server = 'nats://broker.example:4333'
+        with patch('hint_ready.sys.stdin.isatty', return_value=True), \
+                patch('builtins.input', side_effect=['https://wrong.example', server]) as prompt:
+            self.install(local=False)
+        self.assertEqual(prompt.call_count, 2)
+        self.assertEqual(json.loads(self.paths.config.read_text())['nats_server'], server)
+        self.assertIn('nats_server must be a full nats://host:port or tls://host:port URL', self.output.getvalue())
+        self.assertNotIn('Traceback', self.output.getvalue())
+
+    def test_fresh_noninteractive_install_requires_server_or_local(self):
+        with patch('hint_ready.sys.stdin.isatty', return_value=False), \
+                self.assertRaisesRegex(ReadyError, '--server.*--local'):
+            self.install(local=False)
+        self.assertFalse(self.paths.config.exists())
+        self.assertFalse(self.paths.environment.exists())
+        self.assertEqual(self.calls, [])
+
+    def test_closed_prompt_fails_cleanly_without_changes(self):
+        with patch('hint_ready.sys.stdin.isatty', return_value=True), \
+                patch('builtins.input', side_effect=EOFError), \
+                self.assertRaisesRegex(ReadyError, 'No server selected.*--server.*--local'):
+            self.install(local=False)
+        self.assertFalse(self.paths.config.exists())
+        self.assertFalse(self.paths.environment.exists())
+        self.assertEqual(self.calls, [])
+
     def test_explicit_server_does_not_prompt(self):
         server = 'nats://broker.example:4333'
         with patch('builtins.input', side_effect=AssertionError('unexpected prompt')):
@@ -255,6 +290,50 @@ class InstallTests(unittest.TestCase):
         with patch('builtins.input', side_effect=AssertionError('unexpected prompt')):
             self.install(local=True)
         self.assertIsNone(json.loads(self.paths.config.read_text())['nats_server'])
+
+    def test_first_setup_accepts_simple_server_addresses(self):
+        cases = {
+            'broker': 'nats://broker:4222',
+            'HAL50K:4333': 'nats://HAL50K:4333',
+            'broker.example': 'nats://broker.example:4222',
+            '192.168.1.12': 'nats://192.168.1.12:4222',
+            '192.168.1.12:4333': 'nats://192.168.1.12:4333'
+        }
+        for value, expected in cases.items():
+            with self.subTest(value=value):
+                args = options()
+                args.server = value
+                configuration, _ = hint_ready._configuration(self.paths, args)
+                self.assertEqual(configuration['nats_server'], expected)
+                self.assertFalse(self.paths.config.exists())
+
+    def test_interactive_server_shorthand_is_saved_as_url(self):
+        with patch('hint_ready.sys.stdin.isatty', return_value=True), \
+                patch('builtins.input', return_value='broker:4333'):
+            self.install(local=False)
+        self.assertEqual(json.loads(self.paths.config.read_text())['nats_server'], 'nats://broker:4333')
+
+    def test_simple_server_addresses_reject_paths_credentials_and_invalid_ports(self):
+        for value in ('/tmp/broker', './broker', 'broker/file', 'broker name',
+                      'user:password@broker', 'broker?x=1', 'broker#name',
+                      'broker:0', 'broker:65536', 'broker:abc', '192.168.1.999',
+                      '2001:db8::1', 'https://broker'):
+            with self.subTest(value=value):
+                args = options()
+                args.server = value
+                with self.assertRaises(hint_ready.HintError):
+                    hint_ready._configuration(self.paths, args)
+                self.assertFalse(self.paths.config.exists())
+        self.assertEqual(self.calls, [])
+
+    def test_full_server_urls_preserve_tls_credentials_and_ipv6(self):
+        for value in ('tls://username:password@broker.example:4443',
+                      'nats://[2001:db8::1]:4222', 'nats://broker.example'):
+            with self.subTest(value=value):
+                args = options()
+                args.server = value
+                configuration, _ = hint_ready._configuration(self.paths, args)
+                self.assertEqual(configuration['nats_server'], value)
 
     def test_configuration_created_during_install_is_not_silently_substituted(self):
         changed = b'{"nats_server":"nats://other.example:4222"}\n'
@@ -423,6 +502,27 @@ class InstallTests(unittest.TestCase):
             self.install(local=False, server='https://wrong.example')
         self.assertEqual(self.calls, [])
 
+    def test_invalid_server_cli_returns_actionable_error_without_traceback(self):
+        with patch('hint_ready.Paths.current', return_value=self.paths), \
+                patch('hint_ready.find_source', return_value=self.source):
+            result = hint_ready.main(['--install', '--server', 'https://wrong.example'])
+        self.assertEqual(result, 1)
+        self.assertIn('nats_server must be a full nats://host:port or tls://host:port URL', self.output.getvalue())
+        self.assertNotIn('Traceback', self.output.getvalue())
+        self.assertEqual(self.calls, [])
+
+    def test_invalid_existing_configuration_cli_fails_cleanly_and_preserves_file(self):
+        self.paths.config.parent.mkdir(parents=True)
+        contents = '{"nats_server":"https://wrong.example"}\n'
+        self.paths.config.write_text(contents)
+        with patch('hint_ready.Paths.current', return_value=self.paths), \
+                patch('hint_ready.find_source', return_value=self.source):
+            result = hint_ready.main(['--install'])
+        self.assertEqual(result, 1)
+        self.assertNotIn('Traceback', self.output.getvalue())
+        self.assertEqual(self.paths.config.read_text(), contents)
+        self.assertEqual(self.calls, [])
+
     def test_reconfiguration_never_overwrites_existing_settings(self):
         self.install()
         configuration = self.paths.config.read_bytes()
@@ -457,6 +557,19 @@ class InstallTests(unittest.TestCase):
         with patch('hint_ready._runtime') as runtime:
             hint_ready._ready_message(self.paths, status)
         runtime.assert_not_called()
+
+    def test_ready_network_failure_identifies_settings_and_redacts_credentials(self):
+        self.install(local=False, server='nats://username:secret-password@broker.example:4333')
+        self.output.truncate(0)
+        self.output.seek(0)
+        hint_ready._ready_message(self.paths, {'host': 'testhost', 'network': 'unavailable'})
+        output = self.output.getvalue()
+        self.assertIn('nats://[redacted]@broker.example:4333', output)
+        self.assertIn(str(self.paths.config), output)
+        self.assertIn('VPN LAN access', output)
+        self.assertIn('journalctl --user -u hint.service', output)
+        self.assertNotIn('username', output)
+        self.assertNotIn('secret-password', output)
 
     def test_wake_install_is_explicit_and_preserved(self):
         self.install(enable_wake=True)

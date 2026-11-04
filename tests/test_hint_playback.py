@@ -63,9 +63,25 @@ class PlaybackTests(unittest.TestCase):
         self.assertEqual((self.home / "long").read_text(), "x" * 1000)
 
     def test_invalid_syntax_runs_nothing(self):
+        marker = self.root / "unexpected"
         with self.assertRaisesRegex(HintError, "Invalid command syntax"):
-            playback.launch('touch unexpected; echo "unterminated')
-        self.assertFalse((self.home / "unexpected").exists())
+            playback.launch('touch ' + shlex.quote(str(marker)) + '; echo "unterminated')
+        self.assertFalse(marker.exists())
+
+    def test_syntax_check_never_executes_commands_substitutions_or_redirections(self):
+        command = self.root / "command"
+        substitution = self.root / "substitution"
+        redirection = self.root / "redirection"
+        action = (
+            'printf command > ' + shlex.quote(str(command)) + '; '
+            'printf "%s" "$(printf substitution > ' + shlex.quote(str(substitution)) + ')" > '
+            + shlex.quote(str(redirection)) + '; exit 17'
+        )
+        with patch.object(playback, "_spawn", return_value="command") as spawn:
+            self.assertEqual(playback.launch(action), "command")
+            spawn.assert_called_once_with([playback.SHELL, "-c", action], detail=action)
+        for marker in (command, substitution, redirection):
+            self.assertFalse(marker.exists(), "syntax validation executed: " + marker.name)
 
     def test_finished_child_is_reaped_by_poll_without_next_launch(self):
         run = self.launch("exit 17")
