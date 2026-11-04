@@ -1,11 +1,11 @@
-# HINT — Human INTerrupt
+# HINT - Human INTerrupt
 
 [![Tests](https://github.com/jim-lewis-dev/hint/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/jim-lewis-dev/hint/actions/workflows/test.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 **An alarm clock with unreasonable ambition.**
 
-Launch reminders, media, messages, and commands—locally, remotely, or on a
+Launch reminders, media, messages, and commands locally, remotely, or on a
 schedule.
 
 ```bash
@@ -21,9 +21,9 @@ Core NATS through [Agent Messenger](https://github.com/jim-lewis-dev/agent_messe
 and [NATS transport](https://github.com/jim-lewis-dev/nats_transport). There is
 no JetStream or offline message queue. Local use needs no NATS broker.
 
-[Install](#install-once-on-each-computer) · [Examples](#ready-set-fire) ·
-[Remote use](#remote-use) · [Actions](#actions-and-controls) ·
-[Settings](#configuration-and-files) · [Troubleshooting](#troubleshooting-and-removal)
+[Install](#install-once-on-each-computer) | [Examples](#ready-set-fire) |
+[Remote use](#remote-use) | [Actions](#actions-and-controls) |
+[Settings](#configuration-and-files) | [Troubleshooting](#troubleshooting-and-removal)
 
 ## Install once on each computer
 
@@ -40,7 +40,7 @@ cd "$HOME/projects/hint"
 ```
 
 When no saved configuration exists, setup asks for a NATS server hostname,
-IP address, or URL—or `local` for this computer only. You must choose
+IP address, or URL, or `local` for this computer only. You must choose
 explicitly; empty input does not silently select a server. Updates reuse
 your saved choice.
 

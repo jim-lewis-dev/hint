@@ -1,4 +1,4 @@
-"""HINT — Human INTerrupt. Readable CLI, structured remote commands, one run owner."""
+"""HINT - Human INTerrupt. Readable CLI, structured remote commands, one run owner."""
 from __future__ import annotations
 
 import argparse
@@ -39,7 +39,7 @@ class RemoteAction(OnceAction):
 
 def parser(*, remote_command=False) -> argparse.ArgumentParser:
     p = CommandParser(
-        prog="hint", description="HINT — Human INTerrupt. An alarm clock with unreasonable ambition.",
+        prog="hint", description="HINT - Human INTerrupt. An alarm clock with unreasonable ambition.",
         epilog="Examples:\n  hint --set stretch --popup 'Time to stretch!'\n"
                "  hint --fire stretch --remote beacon\n"
                "  hint --list --remote\n"
@@ -334,7 +334,7 @@ def render(result, args) -> str:
         runs = result.get("runs", [])
         if runs:
             lines += ["", _table(["NAME", "STATE", "DETAIL"], [
-                [item.get("name", item.get("signal", "")), ("launched — tracking unavailable" if item.get("state") == "launched" and item.get("tracking") == "unavailable" else item.get("state", "unknown")),
+                [item.get("name", item.get("signal", "")), ("launched (tracking unavailable)" if item.get("state") == "launched" and item.get("tracking") == "unavailable" else item.get("state", "unknown")),
                  ("exit code " + str(item["exit_code"])) if item.get("exit_code") is not None else item.get("detail", item.get("action", ""))]
                 for item in runs
             ])]

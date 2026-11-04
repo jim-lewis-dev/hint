@@ -414,7 +414,7 @@ def install(source, args, paths=None):
     configuration, table = _configuration(paths, args)
     with install_lock(paths):
         _check_ownership(paths)
-        print('Installing HINT…', flush=True)
+        print('Installing HINT...', flush=True)
         _run(['sudo', 'apt-get', 'update'], timeout=600)
         _run(['sudo', 'apt-get', 'install', '-y', 'python3-venv', 'python3-gi',
               'gir1.2-gtk-3.0', 'mpv', 'xdg-utils', 'bash-completion', 'git'], timeout=600)
@@ -554,7 +554,7 @@ def ready(source, args, paths=None):
     if not (source / '.git').exists():
         # A downloaded source archive can bootstrap too; it cannot fetch updates.
         return install(source, args, paths)
-    print('Checking for updates…', flush=True)
+    print('Checking for updates...', flush=True)
     status = _run(['git', '-C', source, 'status', '--porcelain'], capture=True)
     if status.stdout.strip():
         raise ReadyError('Local source changes prevent updating. Your changes were left untouched.')
@@ -593,7 +593,7 @@ def ready(source, args, paths=None):
         _ready_message(paths, result)
         return result
     if before != after:
-        print(f'Updating HINT from {before[:7]} to {after[:7]}…', flush=True)
+        print(f'Updating HINT from {before[:7]} to {after[:7]}...', flush=True)
         # Continue with the freshly fetched installer, not this older module.
         options = ['--enable-wake'] if args.enable_wake else []
         if args.server is not None:
