@@ -119,7 +119,7 @@ class InstallTests(unittest.TestCase):
             raise ReadyError('new service unhealthy')
         if not self.active:
             raise ReadyError('service unavailable')
-        return {'service': 'running', 'host': 'testhost', 'network': 'connected'}
+        return {'service': 'running', 'host': 'testhost', 'network': 'connected', 'active_count': self.busy}
 
     def install(self, *, local=None, **values):
         args = options()
@@ -455,6 +455,64 @@ class InstallTests(unittest.TestCase):
         self.assertTrue(self.active)
         self.assertEqual(self.paths.environment.resolve(), old)
         self.assertNotIn(['systemctl', '--user', 'stop', 'hint.service'], self.calls)
+        self.assertFalse(any(call[:2] == ['sudo', 'apt-get'] or call[1:4] == ['-m', 'pip', 'install']
+                             for call in self.calls))
+        self.assertEqual([call[-1] for call in self.calls if call[0] == 'runtime'], ['status'])
+        self.assertEqual(len(list(self.paths.app.glob('env-*'))), 1)
+
+    def test_run_started_during_preparation_still_blocks_final_update_gate(self):
+        self.install()
+        old = self.paths.environment.resolve()
+        self.calls.clear()
+
+        def start_run_after_preflight(argv, **kwargs):
+            result = self.run_tool(argv, **kwargs)
+            if [str(value) for value in argv[1:4]] == ['-m', 'pip', 'install']:
+                self.busy = 1
+            return result
+
+        with patch('hint_ready._run', side_effect=start_run_after_preflight), \
+                self.assertRaisesRegex(ReadyError, 'Finish or stop 1 active runs'):
+            self.install()
+        operations = [call[-1] for call in self.calls if call[0] == 'runtime']
+        self.assertEqual(operations[:2], ['status', 'prepare_update'])
+        self.assertTrue(self.active)
+        self.assertEqual(self.paths.environment.resolve(), old)
+        self.assertNotIn(['systemctl', '--user', 'stop', 'hint.service'], self.calls)
+
+    def test_unresponsive_running_service_aborts_before_preparation(self):
+        self.install()
+        old = self.paths.environment.resolve()
+        self.calls.clear()
+        with patch('hint_ready._runtime', side_effect=ReadyError('Traceback: timed out')), \
+                self.assertRaisesRegex(ReadyError, 'Could not check active HINT runs') as caught:
+            self.install()
+        self.assertNotIn('Traceback', str(caught.exception))
+        self.assertTrue(self.active)
+        self.assertEqual(self.paths.environment.resolve(), old)
+        self.assertEqual(self.calls, [['systemctl', '--user', 'is-active', '--quiet', 'hint.service']])
+
+    def test_invalid_running_status_is_not_assumed_idle(self):
+        self.install()
+        for status in ({'service': 'running'}, {'service': 'running', 'active_count': False},
+                       {'service': 'running', 'active_count': -1}, []):
+            with self.subTest(status=status), patch('hint_ready._runtime', return_value=status), \
+                    self.assertRaisesRegex(ReadyError, 'Could not confirm whether HINT has active runs'):
+                self.calls.clear()
+                self.install()
+            self.assertTrue(self.active)
+            self.assertEqual(self.calls, [['systemctl', '--user', 'is-active', '--quiet', 'hint.service']])
+
+    def test_service_state_failure_is_not_assumed_idle(self):
+        self.install()
+        self.calls.clear()
+        result = subprocess.CompletedProcess([], 1, '', 'Failed to connect to bus')
+        with patch('hint_ready._service', return_value=result), patch('hint_ready._runtime') as runtime, \
+                self.assertRaisesRegex(ReadyError, 'Could not check the HINT service state'):
+            self.install()
+        runtime.assert_not_called()
+        self.assertTrue(self.active)
+        self.assertEqual(self.calls, [])
 
     def test_flat_managed_environment_restores_exact_path_after_failed_activation(self):
         self.paths.environment.mkdir(parents=True)
@@ -667,7 +725,8 @@ class ReadyGitTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.origin = self.root / 'origin'
         self.source = self.root / 'checkout'
-        self.git('init', '--initial-branch=main', self.origin)
+        self.git('init', self.origin)
+        self.git('-C', self.origin, 'symbolic-ref', 'HEAD', 'refs/heads/main')
         self.git('-C', self.origin, 'config', 'user.name', 'HINT test')
         self.git('-C', self.origin, 'config', 'user.email', 'hint-test@example.invalid')
         (self.origin / 'hint_ready.py').write_text('# fixture\n')
@@ -715,6 +774,24 @@ class ReadyGitTests(unittest.TestCase):
         self.assertEqual((self.source / 'hint_ready.py').read_text(), '# updated\n')
         self.assertEqual(installers, [['bash', str(self.source / 'install.sh'), '--enable-wake', '--server', 'nats://dibbles:4222']])
 
+    def test_active_runs_block_source_fastforward_before_new_installer(self):
+        before = self.git('-C', self.source, 'rev-parse', 'HEAD').stdout.strip()
+        self.paths.environment.mkdir(parents=True)
+        (self.paths.environment / '.hint-owned').write_text('HINT managed environment\n')
+        (self.paths.environment / '.hint-revision').write_text(before + '\n')
+        (self.origin / 'hint_ready.py').write_text('# updated\n')
+        self.git('-C', self.origin, 'commit', '-am', 'update source')
+        status = {'service': 'running', 'active_count': 2}
+        with patch('hint_ready._service', return_value=subprocess.CompletedProcess([], 0)), \
+                patch('hint_ready._runtime', return_value=status) as runtime, \
+                patch('hint_ready.install') as install, \
+                self.assertRaisesRegex(ReadyError, 'Finish or stop 2 active runs'):
+            hint_ready.ready(self.source, options(), self.paths)
+        runtime.assert_called_once_with(self.paths.environment / 'bin/python', {'op': 'status'}, timeout=3)
+        install.assert_not_called()
+        self.assertEqual(self.git('-C', self.source, 'rev-parse', 'HEAD').stdout.strip(), before)
+        self.assertEqual((self.source / 'hint_ready.py').read_text(), '# fixture\n')
+
     def test_diverged_checkout_is_not_merged(self):
         self.git('-C', self.source, 'config', 'user.name', 'HINT test')
         self.git('-C', self.source, 'config', 'user.email', 'hint-test@example.invalid')
@@ -737,9 +814,10 @@ class ReadyGitTests(unittest.TestCase):
         (self.paths.environment / '.hint-owned').write_text('HINT managed environment\n')
         self.paths.config.parent.mkdir(parents=True)
         self.paths.config.write_text('{"nats_server": null}')
-        with patch('hint_ready.install') as install, patch('hint_ready._service') as service, patch('hint_ready._import_desktop_environment', return_value={}), patch('hint_ready._wait_running', return_value={'host': 'test', 'service': 'running'}):
+        with patch('hint_ready.install') as install, patch('hint_ready._service') as service, patch('hint_ready._import_desktop_environment', return_value={}), patch('hint_ready._wait_running', return_value={'host': 'test', 'service': 'running', 'active_count': 2}), patch('hint_ready._preflight_update') as preflight:
             hint_ready.ready(self.source, options(), self.paths)
         install.assert_not_called()
+        preflight.assert_not_called()
         self.assertEqual([call.args for call in service.call_args_list], [('enable', 'hint.service'), ('start', 'hint.service')])
 
 

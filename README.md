@@ -365,8 +365,10 @@ hint --ready
 The command updates a clean Git checkout by fast-forward, prepares the new
 installation, and activates it when there are no active runs. It preserves
 settings and definitions. It does not overwrite local source edits or resolve
-divergent Git history. If active runs prevent an update, finish or stop them
-and run it again.
+divergent Git history. Before preparing an update, it checks for active runs
+and asks you to finish or stop them first. It checks again before activation
+in case something started during preparation. An already-current `--ready`
+can still check the service while actions are running.
 
 The new environment is prepared before stopping the working service. Activation
 is checked, and failed activation attempts restore the previous installation.

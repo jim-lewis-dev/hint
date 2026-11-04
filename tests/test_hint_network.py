@@ -27,6 +27,54 @@ def free_port():
 
 
 class NetworkTests(unittest.TestCase):
+    def test_discovery_keeps_reply_delivery_time_after_slow_connection(self):
+        clock = [10.0]
+        emitted = []
+
+        def connect(*args, **kwargs):
+            clock[0] = 10.8
+
+        def collect(*, timeout):
+            clock[0] += timeout
+            return ("hint_server_test",)
+
+        body = {"kind": "discover", "config": {"nats_server": "nats://test:4222",
+                                               "discovery_timeout_seconds": 1},
+                "deadline": 11.0}
+        with patch("nats_transport.NatsTransport", side_effect=connect), \
+                patch("agent_messenger.AgentMessenger") as messenger, \
+                patch.object(network.time, "monotonic", side_effect=lambda: clock[0]), \
+                patch.object(network, "_emit", side_effect=lambda value: emitted.append((clock[0], value))):
+            messenger.return_value.discover.side_effect = collect
+            self.assertEqual(network._client_worker(body), 0)
+        self.assertEqual(len(emitted), 1)
+        self.assertLess(emitted[0][0], body["deadline"])
+        self.assertEqual(emitted[0][1], {"ok": True, "value": ["hint_server_test"]})
+
+    def test_discovery_worker_does_not_import_cli_to_filter_names(self):
+        body = {"kind": "discover", "config": {"nats_server": "nats://test:4222"},
+                "deadline": time.monotonic() + 2}
+        with patch("nats_transport.NatsTransport"), \
+                patch("agent_messenger.AgentMessenger") as messenger, \
+                patch.object(network, "_hint", side_effect=AssertionError("loaded application after discovery")), \
+                patch.object(network, "_emit") as emit:
+            messenger.return_value.discover.return_value = ("unrelated", "hint_server_test", "hint_server_bad name")
+            self.assertEqual(network._client_worker(body), 0)
+        emit.assert_called_once_with({"ok": True, "value": ["hint_server_test"]})
+        messenger.return_value.discover.assert_called_once_with(timeout=1.0)
+
+    def test_discovery_with_no_reply_time_left_does_not_report_empty_success(self):
+        body = {"kind": "discover", "config": {"nats_server": "nats://test:4222"}, "deadline": 10.01}
+        with patch("nats_transport.NatsTransport"), \
+                patch("agent_messenger.AgentMessenger") as messenger, \
+                patch.object(network.time, "monotonic", return_value=10.0), \
+                patch.object(network, "_emit") as emit:
+            self.assertEqual(network._client_worker(body), 1)
+        messenger.return_value.discover.assert_not_called()
+        reply = emit.call_args.args[0]
+        self.assertFalse(reply["ok"])
+        self.assertIn("timed out before it could collect replies", reply["error"])
+
     def test_local_only_rejects_network_operations_without_starting_worker(self):
         with patch.object(hint, "config", return_value={"nats_server": None}), \
                 patch.object(subprocess, "run", side_effect=AssertionError("worker started")):
@@ -228,6 +276,39 @@ class LiveNetworkTests(unittest.TestCase):
         self.reply = {"error": "unknown signal: missing"}
         self.assertEqual(network.remote("test", ["--get", "missing"]), self.reply)
         self.assertEqual(self.received[-1], "hint --get missing")
+
+    def test_live_discovery_delivers_collected_peer_after_slow_start(self):
+        # Spend most of the existing budget in startup, after the real
+        # connection is ready. Discovery must still deliver replies it got.
+        child = '''
+import json,sys,time
+import hint_network as network
+from agent_messenger import AgentMessenger
+body=json.load(sys.stdin)
+original=AgentMessenger.__init__
+def slow_start(self,*args,**kwargs):
+    original(self,*args,**kwargs)
+    time.sleep(max(0,body["deadline"]-time.monotonic()-0.25))
+AgentMessenger.__init__=slow_start
+raise SystemExit(network._client_worker(body))
+'''
+        original_popen = subprocess.Popen
+        children = []
+
+        def start_process(command, *args, **kwargs):
+            if "--client-worker" in command:
+                command = [sys.executable, "-c", child]
+            process = original_popen(command, *args, **kwargs)
+            children.append(process)
+            return process
+
+        self.config["discovery_timeout_seconds"] = 1
+        started = time.monotonic()
+        with patch.object(subprocess, "Popen", side_effect=start_process):
+            self.assertEqual(network.discover(), ["test"])
+        self.assertLess(time.monotonic() - started, 2.2)
+        self.assertEqual(len(children), 1)
+        self.assertIsNotNone(children[0].poll())
 
     def test_live_all_host_listing_uses_existing_peer_list_requests(self):
         from agent_messenger import AgentMessenger

@@ -14,12 +14,13 @@ import threading
 import time
 import uuid
 
-from hint_config import DEFAULTS
+from hint_config import DEFAULTS, HintError, NAME, sanitize_error
 
 
 SERVER_START_TIMEOUT = 10.0
 SERVER_WATCHDOG_SECONDS = 3.0
 SERVER_RETRY_SECONDS = 1.0
+CLIENT_REPLY_SECONDS = 0.05
 _OUTPUT_LOCK = threading.Lock()
 
 
@@ -29,11 +30,11 @@ def _hint():
 
 
 def _error(message: str):
-    return _hint().HintError(message)
+    return HintError(message)
 
 
 def _safe(error: object) -> str:
-    return _hint().sanitize_error(error)
+    return sanitize_error(error)
 
 
 def _configured() -> dict:
@@ -244,9 +245,14 @@ def _client_worker(body: dict) -> int:
         if remaining <= 0:
             raise _error("HINT network operation timed out")
         if body["kind"] == "discover":
-            window = min(float(config.get("discovery_timeout_seconds", DEFAULTS["discovery_timeout_seconds"])), remaining)
+            # Discovery waits out its whole window. Leave time to deliver the
+            # collected names before the parent process enforces its deadline.
+            window = min(float(config.get("discovery_timeout_seconds", DEFAULTS["discovery_timeout_seconds"])),
+                         remaining - CLIENT_REPLY_SECONDS)
+            if window <= 0:
+                raise _error("HINT discovery timed out before it could collect replies")
             value = sorted(name for name in messenger.discover(timeout=window)
-                           if name.startswith("hint_server_") and _hint().NAME.fullmatch(name))
+                           if name.startswith("hint_server_") and NAME.fullmatch(name))
         else:
             sent = True
             reply = messenger.request(body["recipient"],

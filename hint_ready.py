@@ -291,6 +291,31 @@ def _runtime(python, body, timeout=5, process_timeout=None):
     return json.loads(result.stdout)
 
 
+def _preflight_update(paths):
+    """Read the existing service before preparing an update; do not reserve it."""
+    environment = _owned_environment(paths.environment, paths)
+    if environment is None:
+        return
+    state = _service('is-active', '--quiet', 'hint.service', check=False, capture=True).returncode
+    if state in (3, 4):
+        return
+    if state:
+        raise ReadyError('Could not check the HINT service state. Run systemctl --user status hint.service before updating.')
+    try:
+        status = _runtime(environment / 'bin/python', {'op': 'status'}, timeout=3)
+    except (ReadyError, OSError, ValueError, subprocess.TimeoutExpired):
+        raise ReadyError('Could not check active HINT runs. The running service was left alone. '
+                         'Run hint --status before updating.') from None
+    count = status.get('active_count') if isinstance(status, dict) else None
+    if type(count) is not int or count < 0 or status.get('service') != 'running':
+        raise ReadyError('Could not confirm whether HINT has active runs. The running service was left alone. '
+                         'Run hint --status before updating.')
+    if count:
+        raise ReadyError(f'Update available. Finish or stop {count} active runs, then run hint --ready again.')
+    if status.get('updating'):
+        raise ReadyError('Another HINT update is already in progress.')
+
+
 def _wait_running(python):
     deadline = time.monotonic() + 8
     last = 'service did not become ready'
@@ -414,6 +439,7 @@ def install(source, args, paths=None):
     configuration, table = _configuration(paths, args)
     with install_lock(paths):
         _check_ownership(paths)
+        _preflight_update(paths)
         print('Installing HINT...', flush=True)
         _run(['sudo', 'apt-get', 'update'], timeout=600)
         _run(['sudo', 'apt-get', 'install', '-y', 'python3-venv', 'python3-gi',
@@ -576,12 +602,15 @@ def ready(source, args, paths=None):
             return result
         raise
     before = _source_revision(source)
+    marker = paths.environment / '.hint-revision'
+    installed_revision = marker.read_text().strip() if marker.is_file() else None
+    incoming = _run(['git', '-C', source, 'rev-list', '--count', 'HEAD..FETCH_HEAD'], capture=True)
+    if int(incoming.stdout.strip()) or installed_revision != before or args.enable_wake:
+        _preflight_update(paths)
     merged = _run(['git', '-C', source, 'merge', '--ff-only', '--', 'FETCH_HEAD'], capture=True, check=False)
     if merged.returncode:
         raise ReadyError('Local and remote history have diverged. Resolve the Git history before updating.')
     after = _source_revision(source)
-    marker = paths.environment / '.hint-revision'
-    installed_revision = marker.read_text().strip() if marker.is_file() else None
     if before == after and installed_revision == after and not args.enable_wake:
         if args.server is not None or args.local:
             configuration, table = _configuration(paths, args)
