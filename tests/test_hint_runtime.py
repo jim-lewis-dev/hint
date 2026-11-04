@@ -48,8 +48,11 @@ class RuntimeTests(unittest.TestCase):
         self.addCleanup(self.patch.stop)
         self.actions = []
 
-        def launch(action):
-            value = FakeAction(action)
+        def launch(action=None, *, popup=None):
+            value = FakeAction(popup if popup is not None else action)
+            if popup is not None:
+                value.kind = "popup"
+                value.pausable = False
             self.actions.append(value)
             return value
 
@@ -90,12 +93,190 @@ class RuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(HintError, "reserved"):
             self.manager.start("HINT-003", "third")
 
+    def test_saved_and_temporary_popups_have_owned_runs_and_literal_text(self):
+        message = 'Dinner!\n"Now"; $HOME; $(touch unexpected)'
+        self.definitions["dinner"] = {"popup": message}
+        self.assertTrue(self.manager.dispatch({"op": "fire", "name": "dinner"})["fired"])
+        temporary = self.manager.dispatch({"op": "fire", "popup": message})
+        self.assertEqual(temporary["signal"], "HINT-001")
+        runs = self.manager.status()["runs"]
+        self.assertEqual([run["popup"] for run in runs], [message, message])
+        self.assertTrue(all("action" not in run for run in runs))
+        self.assertEqual([run["kind"] for run in runs], ["popup", "popup"])
+        self.assertEqual([action.detail for action in self.actions], [message, message])
+        self.assertEqual(self.manager.control("pause", "dinner")["unsupported"], 1)
+        self.assertEqual(self.manager.control("stop", "dinner")["count"], 1)
+        self.assertEqual(self.manager.control("stop", "HINT-001")["count"], 1)
+
+    def test_popup_request_validation_does_not_start_a_run(self):
+        for body in ({"op": "fire", "action": "true", "popup": "hello"},
+                     {"op": "fire", "name": "stretch", "popup": "hello"},
+                     {"op": "fire", "popup": " "}, {"op": "fire", "popup": "a\0b"},
+                     {"op": "fire", "popup": 3}):
+            with self.subTest(body=body), self.assertRaises(HintError):
+                self.manager.dispatch(body)
+        self.assertEqual(self.actions, [])
+
     def test_simultaneous_fires_receive_distinct_temporary_names(self):
         with ThreadPoolExecutor(max_workers=8) as executor:
             results = list(executor.map(lambda _: self.manager.start(None, "anything"), range(20)))
         self.assertEqual({result["signal"] for result in results},
                          {f"HINT-{number:03d}" for number in range(1, 21)})
         self.assertEqual(self.manager.status()["active_count"], 20)
+
+    def test_blocked_second_launch_keeps_status_controls_and_other_launches_responsive(self):
+        self.manager.start("stretch", "already running")
+        launching = threading.Event()
+        release = threading.Event()
+        original_launcher = self.manager._launcher
+
+        def launch(action):
+            if action == "blocked network file":
+                launching.set()
+                self.assertTrue(release.wait(timeout=3), "test did not release launcher")
+            return original_launcher(action)
+
+        self.manager._launcher = launch
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            pending = executor.submit(self.manager.start, "stretch", "blocked network file")
+            self.assertTrue(launching.wait(timeout=1))
+            try:
+                status = executor.submit(self.manager.status).result(timeout=0.5)
+                self.assertEqual([run["state"] for run in status["runs"]], ["running", "starting"])
+                paused = executor.submit(self.manager.control, "pause", "stretch").result(timeout=0.5)
+                self.assertEqual((paused["count"], paused["unsupported"]), (1, 1))
+                fired = executor.submit(self.manager.start, None, "independent").result(timeout=0.5)
+                self.assertTrue(fired["fired"])
+                stopped = executor.submit(self.manager.control, "stop", "stretch").result(timeout=0.5)
+                self.assertEqual((stopped["count"], stopped["pending"]), (2, 1))
+                self.assertEqual(self.actions[0].events, ["pause", "stop"])
+                repeated = executor.submit(self.manager.control, "stop", "stretch").result(timeout=0.5)
+                self.assertEqual(repeated["already"], 1)
+            finally:
+                release.set()
+            with self.assertRaisesRegex(HintError, "stopped while starting"):
+                pending.result(timeout=1)
+        self.assertEqual(self.actions[-1].events, ["stop"])
+        self.assertTrue(all(run["state"] == "stopped" for run in self.manager.status("stretch")["runs"]))
+
+    def test_pending_launch_reserves_name_and_blocks_update_until_cancellation_finishes(self):
+        launching = threading.Event()
+        release = threading.Event()
+        original_launcher = self.manager._launcher
+
+        def launch(action):
+            if action == "blocked":
+                launching.set()
+                self.assertTrue(release.wait(timeout=3))
+            return original_launcher(action)
+
+        self.manager._launcher = launch
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            pending = executor.submit(self.manager.start, None, "blocked")
+            self.assertTrue(launching.wait(timeout=1))
+            try:
+                busy = executor.submit(self.manager.dispatch, {"op": "prepare_update"}).result(timeout=0.5)
+                self.assertFalse(busy["ready"])
+                self.assertEqual(busy["active"], 1)
+                next_run = executor.submit(self.manager.start, None, "ready").result(timeout=0.5)
+                self.assertEqual(next_run["signal"], "HINT-002")
+                self.manager.control("stop", "HINT-002")
+                stopped = self.manager.control("stop", "HINT-001")
+                self.assertEqual(stopped["pending"], 1)
+                self.assertFalse(self.manager.dispatch({"op": "prepare_update"})["ready"])
+            finally:
+                release.set()
+            with self.assertRaisesRegex(HintError, "stopped while starting"):
+                pending.result(timeout=1)
+        self.assertTrue(self.manager.dispatch({"op": "prepare_update"})["ready"])
+
+    def test_close_cancels_pending_launch_and_stops_child_returned_after_close(self):
+        launching = threading.Event()
+        release = threading.Event()
+        child = FakeAction("late child")
+
+        def launch(action):
+            launching.set()
+            self.assertTrue(release.wait(timeout=3))
+            return child
+
+        self.manager._launcher = launch
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            pending = executor.submit(self.manager.start, None, "blocked")
+            self.assertTrue(launching.wait(timeout=1))
+            try:
+                executor.submit(self.manager.close).result(timeout=0.5)
+            finally:
+                release.set()
+            with self.assertRaisesRegex(HintError, "stopped while starting"):
+                pending.result(timeout=1)
+        self.assertEqual(child.events, ["stop"])
+        self.assertEqual(self.manager.status()["active_count"], 0)
+
+    def test_failed_launch_releases_pending_run_and_records_failure(self):
+        def fail(action):
+            raise HintError("Network file could not be read")
+
+        self.manager._launcher = fail
+        with self.assertRaisesRegex(HintError, "Network file could not be read"):
+            self.manager.start(None, "unavailable")
+        status = self.manager.status()
+        self.assertEqual(status["active_count"], 0)
+        self.assertEqual(status["runs"][-1]["state"], "failed")
+        self.assertEqual(status["runs"][-1]["detail"], "Network file could not be read")
+        self.assertFalse(any(key.startswith("_") for key in status["runs"][-1]))
+        self.assertTrue(self.manager.dispatch({"op": "prepare_update"})["ready"])
+
+    def test_failed_stop_of_cancelled_late_child_remains_retryable(self):
+        child = FakeAction("late child")
+        stop = child.stop
+        child.stop = lambda: (_ for _ in ()).throw(HintError("temporary control failure"))
+
+        def launch(action):
+            self.manager.control("stop", "stretch")
+            return child
+
+        self.manager._launcher = launch
+        with self.assertRaisesRegex(HintError, "Could not stop cancelled run"):
+            self.manager.start("stretch", "blocked")
+        self.assertEqual(self.manager.status("stretch")["active_count"], 1)
+        child.stop = stop
+        result = self.manager.control("stop", "stretch")
+        self.assertEqual((result["count"], result["pending"]), (1, 0))
+        self.assertEqual(child.events, ["stop"])
+
+    def test_builtin_launcher_receives_a_stable_session_and_live_cancellation_check(self):
+        launching = threading.Event()
+        release = threading.Event()
+        options = {}
+        child = FakeAction("late child")
+
+        def launch(action, *, environment, cancelled):
+            options.update(environment=environment, cancelled=cancelled)
+            launching.set()
+            self.assertTrue(release.wait(timeout=3))
+            return child
+
+        self.manager._launcher = None
+        with patch.dict(os.environ, {"DISPLAY": ":before"}), patch("hint_playback.launch", side_effect=launch):
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                pending = executor.submit(self.manager.start, None, "blocked")
+                self.assertTrue(launching.wait(timeout=1))
+                try:
+                    self.assertFalse(options["cancelled"]())
+                    session = executor.submit(self.manager.dispatch, {
+                        "op": "session", "environment": {"DISPLAY": ":after"}
+                    }).result(timeout=0.5)
+                    self.assertTrue(session["updated"])
+                    self.assertEqual(options["environment"]["DISPLAY"], ":before")
+                    self.assertEqual(os.environ["DISPLAY"], ":after")
+                    self.manager.control("stop", "HINT-001")
+                    self.assertTrue(options["cancelled"]())
+                finally:
+                    release.set()
+                with self.assertRaisesRegex(HintError, "stopped while starting"):
+                    pending.result(timeout=1)
+        self.assertEqual(child.events, ["stop"])
 
     def test_deleted_definition_does_not_hide_or_orphan_running_action(self):
         self.manager.dispatch({"op": "fire", "name": "stretch"})

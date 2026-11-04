@@ -1,6 +1,7 @@
 """Owned media, window and command processes for the HINT service."""
 from __future__ import annotations
 
+from contextvars import ContextVar
 import errno
 import json
 import mimetypes
@@ -9,6 +10,7 @@ from pathlib import Path
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -21,10 +23,23 @@ from hint_config import HintError
 SERVICE_MODE = False
 SHELL = "/bin/sh"
 GUI_PYTHON = "/usr/bin/python3"
+PATH_PROBE_SECONDS = 2.0
+_LAUNCH_CONTEXT = ContextVar("hint_launch_context", default=None)
 OFFICE_SUFFIXES = {
     ".odt", ".ods", ".odp", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
     ".rtf", ".csv"
 }
+
+
+def _launch_environment():
+    context = _LAUNCH_CONTEXT.get()
+    return context[0] if context is not None else os.environ
+
+
+def _check_cancelled():
+    context = _LAUNCH_CONTEXT.get()
+    if context is not None and context[1] is not None and context[1]():
+        raise HintError("Action launch was cancelled.")
 
 
 def _group_alive(group: int) -> bool:
@@ -63,13 +78,13 @@ def _temporary(kind: str, browser: str | None = None) -> Path:
             base = Path.home() / "snap" / snap / "common"
             base.mkdir(parents=True, exist_ok=True, mode=0o700)
         else:
-            cache = Path(os.environ.get("XDG_CACHE_HOME", ""))
+            cache = Path(_launch_environment().get("XDG_CACHE_HOME", ""))
             if not cache.is_absolute():
                 cache = Path.home() / ".cache"
             base = cache / "hint"
             base.mkdir(parents=True, exist_ok=True, mode=0o700)
     else:
-        runtime = Path(os.environ.get("XDG_RUNTIME_DIR", ""))
+        runtime = Path(_launch_environment().get("XDG_RUNTIME_DIR", ""))
         if runtime.is_absolute() and runtime.is_dir() and runtime.stat().st_uid == os.getuid():
             base = runtime
     if not browser and base is not None and len(os.fsencode(base)) > 65:
@@ -237,15 +252,18 @@ class ManagedAction:
 def _spawn(argv, *, kind="command", detail="", pausable=True,
            controllable=True, temporary=None, ipc=None):
     try:
+        _check_cancelled()
         process = subprocess.Popen(
             argv, stdin=subprocess.DEVNULL,
             stdout=2 if SERVICE_MODE else subprocess.DEVNULL,
             stderr=2 if SERVICE_MODE else subprocess.DEVNULL,
-            start_new_session=True, cwd=Path.home()
+            start_new_session=True, cwd=Path.home(), env=_launch_environment()
         )
-    except OSError as exc:
+    except (OSError, HintError) as exc:
         if temporary is not None:
             shutil.rmtree(temporary, ignore_errors=True)
+        if isinstance(exc, HintError):
+            raise
         if isinstance(exc, FileNotFoundError):
             raise HintError(f"Cannot launch action: '{argv[0]}' is not available.") from exc
         raise HintError(f"Cannot launch action: {exc}") from exc
@@ -254,7 +272,8 @@ def _spawn(argv, *, kind="command", detail="", pausable=True,
 
 
 def _desktop():
-    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+    environment = _launch_environment()
+    if not (environment.get("DISPLAY") or environment.get("WAYLAND_DISPLAY")):
         raise HintError("Cannot display this action: no usable desktop session.")
 
 
@@ -296,19 +315,22 @@ def _popup(value, *, file=False):
 
 def _fullscreen_owned(action):
     """Optional X11 fallback, targeting only windows in this process group."""
-    if not os.environ.get("DISPLAY") or not shutil.which("wmctrl"):
+    environment = dict(_launch_environment())
+    if not environment.get("DISPLAY") or not shutil.which("wmctrl"):
         return
 
     def attempt():
         deadline = time.monotonic() + 3
         while time.monotonic() < deadline and action.poll() is None:
             try:
-                result = subprocess.run(["wmctrl", "-lp"], text=True, capture_output=True, timeout=0.3)
+                result = subprocess.run(["wmctrl", "-lp"], text=True, capture_output=True,
+                                        timeout=0.3, env=environment)
                 for line in result.stdout.splitlines():
                     fields = line.split(None, 4)
                     if len(fields) >= 3 and fields[2].isdigit() and os.getpgid(int(fields[2])) == action.pid:
                         subprocess.run(["wmctrl", "-ir", fields[0], "-b", "add,fullscreen"],
-                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=0.3)
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                       timeout=0.3, env=environment)
                         return
             except (OSError, subprocess.TimeoutExpired):
                 pass
@@ -320,7 +342,9 @@ def _document(path, mime):
     _desktop()
     if mime == "application/pdf":
         return _browser(path.as_uri())
-    if path.suffix.lower() in OFFICE_SUFFIXES and shutil.which("libreoffice"):
+    office_types = {mimetypes.guess_type("file" + suffix)[0] for suffix in OFFICE_SUFFIXES}
+    office = path.suffix.lower() in OFFICE_SUFFIXES or bool(mime and mime in office_types)
+    if office and shutil.which("libreoffice"):
         program = shutil.which("libreoffice")
         temporary = _temporary("office", browser=program)
         action = _spawn([program, "-env:UserInstallation=" + temporary.as_uri(),
@@ -334,37 +358,112 @@ def _document(path, mime):
                   pausable=False, controllable=False)
 
 
-def launch(action: str) -> ManagedAction:
-    """Interpret an action once and launch it without terminal interaction."""
+def _inspect_path(path: Path) -> dict:
+    """Run only in the disposable worker: network filesystem calls can block."""
+    try:
+        mode = path.stat().st_mode
+    except OSError as exc:
+        if exc.errno in {errno.ENOENT, errno.ENOTDIR, errno.ENAMETOOLONG, errno.ELOOP}:
+            return {"kind": "missing"}
+        raise
+    if stat.S_ISDIR(mode):
+        files = [str(entry) for entry in sorted(path.iterdir()) if entry.is_file()]
+        return {"kind": "directory", "files": files}
+    mime = mimetypes.guess_type(str(path))[0] or ""
+    if not mime and path.is_symlink():
+        # Extensionless links can still inherit their target's media type. Keep
+        # this optional inspection in the worker and pass the original path on.
+        try:
+            mime = mimetypes.guess_type(str(path.resolve()))[0] or ""
+        except OSError:
+            pass
+    return {"kind": "file", "executable": os.access(path, os.X_OK), "mime": mime}
+
+
+def _reap_probe(process):
+    """Collect a killed probe without making service responsiveness depend on FUSE."""
+    try:
+        process.communicate()
+    except (OSError, ValueError):
+        pass
+
+
+def _probe_path(path: Path) -> dict:
+    _check_cancelled()
+    try:
+        process = subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "--inspect-path"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, start_new_session=True, env=_launch_environment()
+        )
+    except OSError as exc:
+        raise HintError(f"Cannot inspect action path: {exc}") from exc
+    try:
+        output, error = process.communicate(json.dumps(str(path)), timeout=PATH_PROBE_SECONDS)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        # An unresponsive filesystem may delay process exit even after SIGKILL.
+        # This worker cannot launch an action, so it is safe to reap separately.
+        threading.Thread(target=_reap_probe, args=(process,),
+                         name="hint-path-reaper", daemon=True).start()
+        raise HintError(
+            f"Cannot inspect '{path}' within {PATH_PROBE_SECONDS:g}s. "
+            "Check the file or network share; nothing was launched."
+        ) from None
+    if process.returncode:
+        raise HintError(f"Cannot inspect '{path}': {error.strip() or 'path worker failed'}")
+    _check_cancelled()
+    try:
+        result = json.loads(output)
+        if result["kind"] == "error":
+            raise HintError(f"Cannot inspect '{path}': {result['message']}")
+        if result["kind"] not in {"missing", "file", "directory"}:
+            raise ValueError("unknown path kind")
+        return result
+    except (ValueError, KeyError, TypeError) as exc:
+        raise HintError(f"Cannot inspect '{path}': invalid path worker response") from exc
+
+
+def launch(action: str | None = None, *, popup: str | None = None,
+           environment: dict | None = None, cancelled=None) -> ManagedAction:
+    """Use one desktop session snapshot even when another launch runs concurrently."""
+    token = _LAUNCH_CONTEXT.set((dict(os.environ if environment is None else environment), cancelled))
+    try:
+        _check_cancelled()
+        return _launch(action, popup=popup)
+    finally:
+        _LAUNCH_CONTEXT.reset(token)
+
+
+def _launch(action: str | None = None, *, popup: str | None = None) -> ManagedAction:
+    """Launch a literal popup or interpret an action without terminal interaction."""
+    if popup is not None:
+        if action is not None:
+            raise HintError("Supply either --action or --popup.")
+        if not isinstance(popup, str) or not popup.strip():
+            raise HintError("Popup text cannot be empty.")
+        if "\0" in popup:
+            raise HintError("Popup text cannot contain a NUL character.")
+        return _popup(popup)
     if not isinstance(action, str) or not action.strip():
         raise HintError("Action cannot be empty.")
-    action = action.lstrip()
     if "\0" in action:
         raise HintError("Action cannot contain a NUL character.")
-    if action[:6].lower() == "popup:":
-        text = action[6:]
-        if not text.strip():
-            raise HintError("Popup text cannot be empty.")
-        return _popup(text)
     action = action.strip()
     if urlparse(action).scheme.lower() in {"http", "https"}:
         return _browser(action)
-    path = Path(os.path.expanduser(action))
-    try:
-        exists = path.exists()
-    except OSError as exc:
-        if exc.errno != errno.ENAMETOOLONG:
-            raise
-        exists = False
-    if exists:
-        path = path.resolve()
-        if path.is_dir():
-            files = [str(p) for p in sorted(path.iterdir()) if p.is_file()]
+    # Keep the caller's path. Resolving symlinks is unnecessary for MPV and can
+    # fail on otherwise readable GVFS/FUSE paths.
+    path = Path(os.path.expanduser(action)).absolute()
+    inspected = _probe_path(path)
+    if inspected["kind"] != "missing":
+        if inspected["kind"] == "directory":
+            files = inspected["files"]
             if not files:
                 raise HintError(f"Directory contains no files: {path}.")
             return _play("--fullscreen", "--loop-file=no", "--loop-playlist=inf",
                          "--image-display-duration=8", *files, kind="directory", detail=str(path))
-        mime = mimetypes.guess_type(str(path))[0] or ""
+        mime = inspected["mime"]
         if mime.startswith("audio/"):
             return _play("--no-video", "--loop-file=no", "--loop-playlist=no", str(path),
                          kind="audio", detail=str(path))
@@ -374,7 +473,7 @@ def launch(action: str) -> ManagedAction:
         if mime.startswith("image/"):
             return _play("--fullscreen", "--loop-file=inf", "--loop-playlist=no", str(path),
                          kind="image", detail=str(path))
-        if os.access(path, os.X_OK):
+        if inspected["executable"]:
             return _spawn([str(path)], detail=str(path))
         return _document(path, mime)
     try:
@@ -385,3 +484,13 @@ def launch(action: str) -> ManagedAction:
     if syntax.returncode:
         raise HintError("Invalid command syntax: " + syntax.stderr.strip())
     return _spawn([SHELL, "-c", action], detail=action)
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] != ["--inspect-path"]:
+        raise SystemExit(2)
+    try:
+        result = _inspect_path(Path(json.load(sys.stdin)))
+    except (OSError, ValueError) as exc:
+        result = {"kind": "error", "message": str(exc)}
+    print(json.dumps(result))

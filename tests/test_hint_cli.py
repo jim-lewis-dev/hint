@@ -41,10 +41,25 @@ class CliTests(unittest.TestCase):
         value = {'op':'set', 'name':'-bell', 'created':True, 'changed':['action'], 'definition':{'action':'--help'}}
         with patch('hint_network.remote', side_effect=reply), patch('hint.set_signal', return_value=value) as saved:
             self.assertEqual(hint.run(['--remote=peer', '--set=-bell', '--action=--help']), value)
-            saved.assert_called_once_with('-bell', action='--help', when=None, wake=None, no_time=False)
+            saved.assert_called_once_with('-bell', action='--help', popup=None, when=None, wake=None, no_time=False)
         with patch('hint_network.remote', side_effect=reply), patch('hint_runtime.request', return_value={'fired':True,'signal':'HINT-001'}) as runtime:
-            hint.run(['--remote=peer', '--fire', '--action', 'POPUP: Dinner; $HOME <script>'])
-            runtime.assert_called_once_with({'op':'fire','name':None,'action':'POPUP: Dinner; $HOME <script>'})
+            message = 'Dinner! "Now"; $HOME <script>\n$(touch unexpected)'
+            hint.run(['--remote=peer', '--fire', '--popup', message])
+            runtime.assert_called_once_with({'op':'fire','name':None,'popup':message})
+
+    def test_remote_saved_popup_preserves_literal_text_and_schedule(self):
+        message = '--help! "Now"; $HOME\n$(touch unexpected)'
+        with patch('hint_network.remote', return_value={}) as remote:
+            hint.run(['--set', 'dinner', '--popup', message, '--time', '2031', '--remote', 'dibbles'])
+            remote.assert_called_once_with('dibbles', ['--set', 'dinner', '--popup=' + message, '--time', '2031'])
+
+    def test_popup_and_action_use_distinct_runtime_requests(self):
+        with patch('hint_runtime.request', return_value={'fired': True}) as runtime:
+            hint.run(['--fire', '--popup=--help'])
+            runtime.assert_called_once_with({'op': 'fire', 'name': None, 'popup': '--help'})
+        with patch('hint_runtime.request', return_value={'fired': True}) as runtime:
+            hint.run(['--fire', '--action', 'POPUP:hello'])
+            runtime.assert_called_once_with({'op': 'fire', 'name': None, 'action': 'POPUP:hello'})
 
     def test_invalid_commands_never_execute(self):
         for argv in (
@@ -54,9 +69,13 @@ class CliTests(unittest.TestCase):
             ['--fire','bell','--action','true'], ['--fire'], ['--fire','bell','--no-time'],
             ['--set','bell'], ['--set','bell','--time','2027','--no-time'],
             ['--set','bell','--wake','--no-wake'], ['--set','bell','--action',''],
-            ['--set','bell','--action','POPUP:  '], ['--list','--server','nats://host:4222'],
+            ['--set','bell','--popup','  '], ['--list','--server','nats://host:4222'],
             ['--list','--handler','true'], ['--fire','bell','--fire','other'],
-            ['--set','bell','--action','a','--action','b']
+            ['--set','bell','--action','a','--action','b'],
+            ['--fire','--action','true','--popup','hello'],
+            ['--set','bell','--popup','hello','--action','true'],
+            ['--fire','bell','--popup','hello'], ['--fire','--popup',''],
+            ['--list','--popup','hello'], ['--fire','--popup','a','--popup','b']
         ):
             with self.subTest(argv=argv), patch('hint.execute') as execute:
                 status, output, errors = self.invoke(argv)
@@ -73,7 +92,7 @@ class CliTests(unittest.TestCase):
             self.assertNotIn('(',output)
             self.assertEqual(errors,'')
         with patch('hint_runtime.request', return_value={'signal':'HINT-001','fired':True}):
-            status, output, errors = self.invoke(['--fire','--action','popup:Dinner is ready!'])
+            status, output, errors = self.invoke(['--fire','--popup','Dinner is ready!'])
             self.assertEqual(status,0)
             self.assertIn('Fired HINT-001.',output)
             self.assertEqual(errors,'')
@@ -81,7 +100,7 @@ class CliTests(unittest.TestCase):
     def test_set_changes_only_supplied_attributes(self):
         with patch('hint.set_signal', return_value={'definition':{'action':'true'},'created':False,'changed':['time']}) as saved:
             status, output, errors = self.invoke(['--set','bell','--no-time'])
-            saved.assert_called_once_with('bell',action=None,when=None,wake=None,no_time=True)
+            saved.assert_called_once_with('bell',action=None,popup=None,when=None,wake=None,no_time=True)
             self.assertEqual(status,0)
             self.assertIn('schedule cleared',output)
 
@@ -127,6 +146,13 @@ class CliTests(unittest.TestCase):
             self.assertIn('1 failed',errors)
             self.assertIn('process refused',errors)
 
+    def test_repeated_stop_reports_pending_cleanup(self):
+        with patch('hint_runtime.request', return_value={'count':0,'already':1,'pending':1}):
+            status, output, errors = self.invoke(['--stop','music'])
+            self.assertEqual(status,0)
+            self.assertIn('1 already stopping',output)
+            self.assertEqual(errors,'')
+
     def test_terminal_control_characters_are_not_rendered(self):
         with patch('hint.list_signals', return_value={'bell':{'action':'hello\x1b[2J\nworld'}}):
             status, output, errors = self.invoke(['--list'])
@@ -165,8 +191,9 @@ class CliTests(unittest.TestCase):
 
     def test_help_and_empty_command_show_current_interface(self):
         result = subprocess.run([sys.executable,'-m','hint','--help'],capture_output=True,text=True,check=True)
-        for option in ('--remote HOST','--ready','--pause','--no-time','--no-wake','popup:TEXT'):
+        for option in ('--remote HOST','--ready','--pause','--no-time','--no-wake','--popup TEXT'):
             self.assertIn(option,result.stdout)
+        self.assertNotIn('popup:TEXT', result.stdout)
         self.assertNotIn('--handler',result.stdout)
         status, output, errors = self.invoke([])
         self.assertEqual(status,0)

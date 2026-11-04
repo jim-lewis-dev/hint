@@ -40,9 +40,9 @@ class RemoteAction(OnceAction):
 def parser(*, remote_command=False) -> argparse.ArgumentParser:
     p = CommandParser(
         prog="hint", description="HINT — Human INTerrupt. An alarm clock with unreasonable ambition.",
-        epilog="Examples:\n  hint --set stretch --action 'popup:Time to stretch!'\n"
+        epilog="Examples:\n  hint --set stretch --popup 'Time to stretch!'\n"
                "  hint --fire stretch --remote dirtsy\n"
-               "  hint --fire --action 'popup:Dinner is ready!'\n"
+               "  hint --fire --popup 'Dinner is ready!'\n"
                "  hint --set stretch --time '2027-02-10 09:00'\n"
                "  hint --status\n  hint --ready",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -50,7 +50,7 @@ def parser(*, remote_command=False) -> argparse.ArgumentParser:
     )
     op = p.add_mutually_exclusive_group(required=True)
     op.add_argument("--fire", nargs="?", const="", metavar="NAME", action=OnceAction,
-                    help="launch a saved action, or use --action for a temporary run")
+                    help="launch a saved action, or use --action/--popup for a temporary run")
     for flag, help_text in (
         ("get", "show one saved action"), ("remove", "remove a saved definition"),
         ("pause", "pause every active run of a name"),
@@ -78,8 +78,11 @@ def parser(*, remote_command=False) -> argparse.ArgumentParser:
                       action=OnceAction, help="enable waking for this action's schedule")
     wake.add_argument("--no-wake", dest="wake", nargs=0, const=False,
                       action=OnceAction, help="disable waking without clearing the schedule")
-    p.add_argument("--action", metavar="STRING", action=OnceAction,
-                   help="popup:TEXT, URL, existing file/directory, or /bin/sh command")
+    content = p.add_mutually_exclusive_group()
+    content.add_argument("--action", metavar="STRING", action=OnceAction,
+                         help="URL, existing file/directory, or /bin/sh command")
+    content.add_argument("--popup", metavar="TEXT", action=OnceAction,
+                         help="show literal text in HINT's own fullscreen window")
     p.add_argument("--remote", metavar="HOST", action=RemoteAction,
                    help="operate on another HINT computer by hostname")
     setup = p.add_mutually_exclusive_group()
@@ -98,25 +101,25 @@ def validate_args(args) -> None:
         if value not in (None, "") and not NAME.fullmatch(value):
             raise HintError(f"Invalid name '{value}': use letters, digits, '_' or '-'.")
     attributes = args.time is not None or args.no_time or args.wake is not None
+    content = args.action is not None or args.popup is not None
     if args.set_name is not None:
-        if args.action is None and not attributes:
+        if not content and not attributes:
             raise HintError(f"No changes supplied for '{args.set_name}'.")
     elif args.fire is not None:
-        if args.fire and args.action is not None:
-            raise HintError("Supply either a saved name or --action.")
-        if not args.fire and args.action is None:
-            raise HintError("Supply a name or --action to fire.")
+        if args.fire and content:
+            raise HintError("Supply either a saved name, --action or --popup.")
+        if not args.fire and not content:
+            raise HintError("Supply a name, --action or --popup to fire.")
         if attributes:
             raise HintError("--time, --no-time, --wake and --no-wake can only be used with --set.")
-    elif args.action is not None or attributes:
-        raise HintError("Action attributes can only be used with --set, or --action with nameless --fire.")
-    if args.action is not None:
-        if not args.action.strip():
-            raise HintError("Action cannot be empty.")
-        if "\0" in args.action:
-            raise HintError("Action cannot contain a NUL character.")
-        if args.action.lstrip().lower().startswith("popup:") and not args.action.lstrip()[6:].strip():
-            raise HintError("Popup text cannot be empty.")
+    elif content or attributes:
+        raise HintError("Use --action or --popup with --set or nameless --fire; schedule and wake options require --set.")
+    for label, text in (("Action", args.action), ("Popup text", args.popup)):
+        if text is not None:
+            if not text.strip():
+                raise HintError(label + " cannot be empty.")
+            if "\0" in text:
+                raise HintError(label + " cannot contain a NUL character.")
     if args.remote and (args.serve or args.discover or args.ready):
         raise HintError("--serve, --discover and --ready are local operations.")
     if (args.server is not None or args.local or args.enable_wake) and not args.ready:
@@ -132,6 +135,8 @@ def operation_args(args) -> list[str]:
         result = value("--set", args.set_name)
         if args.action is not None:
             result += value("--action", args.action)
+        if args.popup is not None:
+            result += value("--popup", args.popup)
         if args.time is not None:
             result += value("--time", args.time)
         if args.no_time:
@@ -143,6 +148,8 @@ def operation_args(args) -> list[str]:
         result = value("--fire", args.fire) if args.fire else ["--fire"]
         if args.action is not None:
             result += value("--action", args.action)
+        if args.popup is not None:
+            result += value("--popup", args.popup)
         return result
     for option in ("get", "remove", "pause", "resume", "stop", "status"):
         selected = getattr(args, option)
@@ -166,7 +173,8 @@ def execute(args):
         from hint_network import remote
         return remote(args.remote, operation_args(args))
     if args.set_name is not None:
-        return set_signal(args.set_name, action=args.action, when=args.time, wake=args.wake, no_time=args.no_time)
+        return set_signal(args.set_name, action=args.action, popup=args.popup,
+                          when=args.time, wake=args.wake, no_time=args.no_time)
     if args.get is not None:
         return get_signal(args.get)
     if args.list:
@@ -176,7 +184,7 @@ def execute(args):
         try:
             from hint_runtime import request
             status = request({"op": "status"}, timeout=0.3)
-            result["active_count"] = sum(run.get("name") == args.remove and run.get("state") in {"running", "paused", "stopping"}
+            result["active_count"] = sum(run.get("name") == args.remove and run.get("state") in {"starting", "running", "paused", "stopping"}
                                          for run in status.get("runs", []))
         except HintError:
             pass
@@ -186,7 +194,12 @@ def execute(args):
         return discover()
     from hint_runtime import request
     if args.fire is not None:
-        return request({"op": "fire", "name": args.fire or None, "action": args.action})
+        body = {"op": "fire", "name": args.fire or None}
+        if args.action is not None:
+            body["action"] = args.action
+        if args.popup is not None:
+            body["popup"] = args.popup
+        return request(body)
     for option in ("pause", "resume", "stop", "status"):
         target = getattr(args, option)
         if target is not None:
@@ -256,7 +269,8 @@ def _definitions(value, *, remote=False, display_times=None) -> str:
         return display_times.get(value) or (value + " (target local)" if remote else _time(value))
     return _table(["NAME", "SCHEDULE", "WAKE", "ACTION"], [
         [name, scheduled(entry),
-         "enabled" if entry.get("wake") else "disabled", entry["action"]]
+         "enabled" if entry.get("wake") else "disabled",
+         "Popup: " + entry["popup"] if "popup" in entry else entry["action"]]
         for name, entry in sorted(value.items())
     ])
 
@@ -283,7 +297,7 @@ def render(result, args) -> str:
                 text = f"'{name}' is already set that way."
             return prefix + text
         fragments = []
-        if "action" in changed and not result.get("created"):
+        if ("action" in changed or "popup" in changed) and not result.get("created"):
             fragments.append("action changed")
         if "time" in changed:
             fragments.append("scheduled for " + (result.get("time_display") or _time(entry["time"])) if "time" in entry else "schedule cleared")
@@ -339,7 +353,8 @@ def render(result, args) -> str:
         elif count or already or unsupported or failures:
             parts = [f"{past} {count} {'run' if count == 1 else 'runs'}"] if count else []
             if already:
-                parts.append(f"{already} already {'paused' if operation == 'pause' else 'running'}")
+                state = {"pause": "paused", "resume": "running", "stop": "stopping"}[operation]
+                parts.append(f"{already} already {state}")
             if unsupported:
                 parts.append(f"{unsupported} unsupported")
             if failures:

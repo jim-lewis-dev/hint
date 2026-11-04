@@ -129,7 +129,7 @@ def _check_ownership(paths):
         raise ReadyError(f'Cannot replace {source}: it is not owned by this HINT installation.')
 
 
-def _configuration(paths, args):
+def _configuration(paths, args, prepared=None):
     from hint_config import DEFAULTS, validate_config
     from hint_signals import validate
     if paths.config.exists():
@@ -137,6 +137,8 @@ def _configuration(paths, args):
         current_server = validate_config(configuration)['nats_server']
         if (args.server is not None or args.local) and (None if args.local else args.server) != current_server:
             raise ReadyError(f'Existing configuration was preserved. Edit {paths.config} to change its server.')
+    elif prepared is not None:
+        configuration = prepared
     else:
         server = args.server
         if args.local:
@@ -146,6 +148,8 @@ def _configuration(paths, args):
             server = None if answer.lower() == 'local' else answer or DEFAULTS['nats_server']
         configuration = {**DEFAULTS, 'nats_server': server}
     configuration = validate_config(configuration)
+    if prepared is not None and configuration != prepared:
+        raise ReadyError('HINT settings changed during installation. Run hint --ready again.')
     table = json.loads(paths.signals.read_text()) if paths.signals.exists() else {}
     if not isinstance(table, dict):
         raise ReadyError('signals.json must contain a JSON object')
@@ -386,7 +390,7 @@ def install(source, args, paths=None):
                     count = gate.get('active', 0)
                     raise ReadyError(f'Update available. Finish or stop {count} active runs, then run hint --ready again.'
                                      if count else 'Another HINT update is already in progress.')
-            configuration, table = _configuration(paths, args)
+            configuration, table = _configuration(paths, args, prepared=configuration)
             for parent in (paths.command.parent, paths.service.parent, paths.completion.parent, paths.autostart.parent):
                 parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             _create_json(paths.config, configuration)

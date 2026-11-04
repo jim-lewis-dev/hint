@@ -51,7 +51,7 @@ class CompletionTests(unittest.TestCase):
         self.assertNotIn("--handler", self.candidates("hint", "--set", "new_name", ""))
         for operation in ("--get", "--fire", "--remove"):
             candidates = self.candidates("hint", operation, "name", "")
-            self.assertFalse(set(candidates) & {"--action", "--time", "--wake"})
+            self.assertFalse(set(candidates) & {"--action", "--popup", "--time", "--wake"})
         self.assertEqual(self.candidates("hint", "--set", "new_name", "--action", "--f"), [])
         self.assertEqual(self.candidates("hint", "--set", "new_name", "--time", "2026-"), [])
         self.assertNotIn("--get", self.candidates("hint", "--set", "new_name", ""))
@@ -71,10 +71,33 @@ class CompletionTests(unittest.TestCase):
             self.assertEqual(completion.complete(words, 2), ["remote_alarm"])
             request.assert_called_once_with("birch", ["--list"], timeout=completion.COMPLETION_TIMEOUT)
 
-    def test_action_values_are_not_mistaken_for_remote_options(self):
+    def test_payload_values_are_not_mistaken_for_remote_options(self):
         with patch.object(network, "remote", side_effect=AssertionError("network used")):
-            words = ["hint", "--set", "br", "--action", "--remote=other"]
-            self.assertEqual(completion.complete(words, 2), ["breakfast"])
+            for option in ("--action", "--popup"):
+                words = ["hint", "--set", "br", option, "--remote=other"]
+                self.assertEqual(completion.complete(words, 2), ["breakfast"])
+
+    def test_popup_completion_accepts_literal_text_without_suggestions(self):
+        with patch.object(network, "remote", side_effect=AssertionError("network used")), \
+                patch.object(network, "discover", side_effect=AssertionError("discovery used")):
+            for suffix in (("--popup", ""), ("--popup", "--remote=other"),
+                           ("--popup=",), ("--popup=hello",), ("--popup", "=", "")):
+                with self.subTest(suffix=suffix):
+                    self.assertEqual(self.candidates("hint", "--fire", *suffix), [])
+
+    def test_popup_and_action_options_are_mutually_exclusive(self):
+        for first, second in (("--popup", "--action"), ("--action", "--popup")):
+            for operation in (("--set", "probe"), ("--fire",)):
+                with self.subTest(first=first, operation=operation):
+                    self.assertNotIn(second, self.candidates("hint", *operation, first, "text", ""))
+                    self.assertNotIn(second, self.candidates("hint", *operation, first + "=text", ""))
+        self.assertEqual(self.candidates("hint", "--set", "probe", "--p"), ["--popup"])
+        self.assertEqual(self.candidates("hint", "--fire", "--p"), ["--popup"])
+
+    def test_supplied_payload_does_not_offer_saved_fire_names(self):
+        for option in ("--action", "--popup"):
+            self.assertEqual(self.candidates("hint", option, "text", "--fire", ""), [])
+            self.assertEqual(self.candidates("hint", option + "=text", "--fire="), [])
 
     def test_discovery_and_remote_are_not_combined(self):
         self.assertNotIn("--remote", self.candidates("hint", "--discover", ""))
@@ -138,8 +161,9 @@ class CompletionTests(unittest.TestCase):
 
     def test_optional_values_offer_switches_only_as_separate_arguments(self):
         self.assertEqual(self.candidates("hint", "--fire", ""),
-                         ["bedtime", "breakfast", "stretch", "--action"])
+                         ["bedtime", "breakfast", "stretch", "--action", "--popup"])
         self.assertNotIn("--fire=--action", self.candidates("hint", "--fire="))
+        self.assertNotIn("--fire=--popup", self.candidates("hint", "--fire="))
         with patch("hint_runtime.request", return_value={"definitions": {"stretch": {}}, "runs": []}):
             self.assertEqual(self.candidates("hint", "--status", ""), ["stretch", "--remote"])
             self.assertEqual(self.candidates("hint", "--status="), ["--status=stretch"])

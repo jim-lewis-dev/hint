@@ -6,7 +6,7 @@ Launch reminders, media, messages, and commands—locally, remotely, or on a
 schedule.
 
 ```bash
-hint --fire --action 'popup:Dinner is ready!' --remote beacon
+hint --fire --popup 'Dinner is ready!' --remote beacon
 ```
 
 HINT can play a song, fill a screen with a message, loop a folder of media,
@@ -31,8 +31,8 @@ cd "$HOME/projects/hint"
 ./hint --ready
 ```
 
-The first setup asks for a NATS server URL or local-only operation. You can
-supply the choice directly:
+The first setup asks once for a NATS server URL or local-only operation. You
+can supply the choice directly:
 
 ```bash
 ./hint --ready --server nats://server:4222
@@ -58,7 +58,7 @@ Open a new terminal, then try:
 
 ```bash
 hint --status
-hint --fire --action 'popup:HINT is ready.'
+hint --fire --popup 'HINT is ready.'
 ```
 
 Dismiss the popup with its button or Escape. If `hint` is not found, ensure
@@ -67,7 +67,7 @@ Dismiss the popup with its button or Escape. If `hint` is not found, ensure
 ## Ready, set, fire
 
 ```bash
-hint --set stretch --action 'popup:Get up and stretch.'
+hint --set stretch --popup 'Get up and stretch.'
 hint --fire stretch
 hint --status stretch
 hint --stop stretch
@@ -89,7 +89,7 @@ Set another time to schedule it again. Existing attributes stay unchanged when
 you omit them:
 
 ```bash
-hint --set stretch --action 'popup:Walk around for five minutes.'
+hint --set stretch --popup 'Walk around for five minutes.'
 hint --set stretch --no-time
 hint --set stretch --no-wake
 ```
@@ -102,7 +102,8 @@ removing the schedule. Neither command stops an active run.
 | Command | Purpose |
 | --- | --- |
 | `hint --ready` | Install or update HINT and ensure its service is running |
-| `hint --set NAME --action STRING` | Create an action or change an existing action string |
+| `hint --set NAME --action STRING` | Save or replace a command, path, or URL |
+| `hint --set NAME --popup TEXT` | Save or replace a popup message |
 | `hint --set NAME --time TIME` | Add or change an existing action's schedule |
 | `hint --set NAME --no-time` | Clear its schedule |
 | `hint --set NAME --wake` / `--no-wake` | Enable or disable its wake preference |
@@ -110,6 +111,7 @@ removing the schedule. Neither command stops an active run.
 | `hint --list` | Show all saved definitions |
 | `hint --fire NAME` | Launch another run of a saved action |
 | `hint --fire --action STRING` | Launch an action without saving a definition |
+| `hint --fire --popup TEXT` | Display a popup without saving a definition |
 | `hint --pause NAME` / `--resume NAME` | Pause or resume the active runs that support it |
 | `hint --stop NAME` | Stop the active runs HINT can control |
 | `hint --status [NAME]` | Show service, schedule, and run information |
@@ -118,8 +120,11 @@ removing the schedule. Neither command stops an active run.
 
 Names use letters, digits, `_`, and `-`, and are case-sensitive. Spell options
 in full. Names of the form `HINT-` followed by digits, ignoring case, are reserved for
-temporary runs. Creating a new definition requires `--action`; modifying an existing one
-requires only the attributes you want to change. Conflicting switches such as
+temporary runs. Creating a new definition requires either `--action` or
+`--popup`; modifying an existing one requires only the attributes you want to
+change. Setting `--popup` replaces its previous action, and setting `--action`
+replaces its previous popup. Schedule and wake settings stay unchanged unless
+you change them. Conflicting switches such as `--action ... --popup ...` or
 `--time ... --no-time` are rejected.
 
 Pause, resume, and stop by a saved name apply to **all its active runs**.
@@ -150,11 +155,11 @@ shared broker. Use the hostname in commands and completion:
 ```bash
 hint --discover
 hint --list --remote beacon
-hint --set stretch --action 'popup:Take a break.' --remote beacon
+hint --set stretch --popup 'Take a break.' --remote beacon
 hint --fire stretch --remote beacon
 hint --status stretch --remote beacon
 hint --stop stretch --remote beacon
-hint --fire --action 'popup:Dinner is ready!' --remote beacon
+hint --fire --popup 'Dinner is ready!' --remote beacon
 ```
 
 Replace `beacon` with a hostname returned by discovery. Every installed computer
@@ -182,11 +187,23 @@ controls. Configure broker listening, authentication, and the client port
 not in the repository. A NATS URL can contain percent-encoded credentials;
 `tls://HOST:PORT` uses the client's TLS trust configuration.
 
+If the broker computer uses UFW, allow its NATS port from your trusted LAN
+subnet. For example, on the **broker computer**:
+
+```bash
+sudo ufw allow proto tcp from 192.168.1.0/24 to any port 4222
+```
+
+Replace `192.168.1.0/24` with your LAN subnet and use the configured NATS port.
+A rule allowing only one client IP will block your other computers. This rule
+does not configure NATS authentication or router port forwarding. VPN settings
+on the broker must also permit LAN traffic.
+
 ## Actions and controls
 
 | Action | What happens | Pause/resume |
 | --- | --- | --- |
-| `popup:Your message` | HINT opens its own fullscreen text window | Not applicable |
+| `--popup 'Your message'` | HINT opens its own fullscreen text window | Not applicable |
 | Audio file | MPV plays once, without a video window | Supported |
 | Video file | MPV plays once fullscreen | Supported |
 | Image file | MPV shows it fullscreen until closed | Pauses animations; static images remain displayed |
@@ -196,8 +213,16 @@ not in the repository. A NATS URL can contain percent-encoded credentials;
 | Executable file | Run the file directly | Suspend/continue its owned processes |
 | Shell command | Run through noninteractive `/bin/sh` | Suspend/continue its owned processes |
 
-The `popup:` prefix is case-insensitive; its message is literal text. `POPUP:`
-and `Popup:` work too. Popup text is not HTML or a shell command.
+`--popup` displays literal text, not HTML or a shell command. Use it with
+`--set NAME` to save a message or with `--fire` to display one immediately.
+`--action` continues to open paths and URLs and treats other text as a shell
+command; it does not recognize popup prefixes. Use single quotes in Bash to
+keep `!`, `$`, and command substitutions literal:
+
+```bash
+hint --fire --popup 'Dinner is ready!'
+hint --set dinner --popup 'Dinner is ready!' --time '2027-01-01 18:00'
+```
 
 Directory playback remains deliberately broad: every immediate regular file,
 including hidden and non-media files, is passed to MPV. It is nonrecursive and
@@ -349,7 +374,8 @@ Completion has its own short network budget and an outer two-second limit.
 It does not wait for a long configured discovery timeout. No answers means no
 candidates, not proof that a computer is absent. Completion never launches an
 action or changes a schedule. Path completion within an arbitrary action string
-is not provided. This integration is for Bash, not Fish or Zsh.
+is not provided. `--popup` accepts free text and does not suggest filenames
+or action names for the message. This integration is for Bash, not Fish or Zsh.
 
 To enable it in an already open Bash terminal:
 

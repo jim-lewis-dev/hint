@@ -80,7 +80,7 @@ class RunManager:
 
     @staticmethod
     def _public(run: dict) -> dict:
-        result = {key: value for key, value in run.items() if key != "_action"}
+        result = {key: value for key, value in run.items() if not key.startswith("_")}
         if run["active"] and "_action" in run:
             try:
                 result["detail"] = run["_action"].detail
@@ -91,6 +91,9 @@ class RunManager:
     def _refresh(self) -> None:
         remaining = []
         for run in self._active:
+            if run.get("_starting"):
+                remaining.append(run)
+                continue
             action = run["_action"]
             code = action.poll()
             if code is None:
@@ -115,7 +118,7 @@ class RunManager:
             self._recent.append(self._public(run))
         self._active = remaining
 
-    def start(self, name: str | None, action: str) -> dict:
+    def start(self, name: str | None, action: str | None = None, *, popup: str | None = None) -> dict:
         with self._lock:
             self._refresh()
             if self._closed:
@@ -127,39 +130,100 @@ class RunManager:
                     raise HintError("Invalid action name.")
                 if TEMPORARY_NAME.fullmatch(name):
                     raise HintError("Names beginning HINT- followed by digits are reserved for temporary runs.")
-            if not isinstance(action, str) or not action.strip():
-                raise HintError("Action cannot be empty.")
+            if action is not None and popup is not None:
+                raise HintError("Supply either --action or --popup.")
+            text = popup if popup is not None else action
+            label = "Popup text" if popup is not None else "Action"
+            if not isinstance(text, str) or not text.strip():
+                raise HintError(label + " cannot be empty.")
+            if "\0" in text:
+                raise HintError(label + " cannot contain a NUL character.")
             temporary = name is None
             target = name if name is not None else f"HINT-{self._next_temporary:03d}"
-            if self._launcher is None:
-                from hint_playback import launch
-                process = launch(action)
-            else:
-                process = self._launcher(action)
-            if process is None:
-                raise HintError("Action launcher did not return a managed run.")
             if temporary:
                 self._next_temporary += 1
-            self._active.append({
+            # Reserve the run before any filesystem access or process launch.
+            # A stalled network mount must not hold the control registry lock.
+            run = {
                 "name": target,
                 "signal": target,
                 "temporary": temporary,
-                "action": action,
-                "kind": process.kind,
-                "detail": process.detail,
-                "pid": process.pid,
-                "state": "running",
+                **({"popup": popup} if popup is not None else {"action": action}),
+                "kind": "starting",
+                "detail": "Starting action",
+                "pid": None,
+                "state": "starting",
                 "active": True,
                 "started_at": _now(),
                 "ended_at": None,
                 "exit_code": None,
-                "pausable": bool(process.pausable),
-                "controllable": bool(process.controllable),
-                "tracking": "unavailable" if getattr(process, "untracked", False) else "owned",
-                "_action": process
-            })
-            return {"op": "fire", "signal": target, "run": target,
-                    "temporary": temporary, "fired": True}
+                "pausable": False,
+                "controllable": True,
+                "tracking": "owned",
+                "_starting": True,
+                "_cancelled": False,
+            }
+            self._active.append(run)
+            environment = dict(os.environ)
+
+        def cancelled_before_spawn():
+            with self._lock:
+                return self._closed or run["_cancelled"]
+
+        try:
+            if self._launcher is None:
+                from hint_playback import launch
+                launch_options = {"environment": environment, "cancelled": cancelled_before_spawn}
+            else:
+                launch = self._launcher
+                launch_options = {}
+            process = launch(popup=popup, **launch_options) if popup is not None else launch(action, **launch_options)
+            if process is None:
+                raise HintError("Action launcher did not return a managed run.")
+        except BaseException as error:
+            with self._lock:
+                run.update(active=False, ended_at=_now(),
+                           state="stopped" if run["_cancelled"] else "failed",
+                           detail=sanitize_error(error))
+                self._active = [item for item in self._active if item is not run]
+                if not self._closed:
+                    self._recent.append(self._public(run))
+                cancelled = run["_cancelled"]
+            if cancelled and isinstance(error, Exception):
+                raise HintError(f"Run '{target}' was stopped while starting.") from None
+            raise
+
+        # Reading player details can involve IPC too, so do it outside the lock.
+        try:
+            detail = process.detail
+        except (HintError, OSError):
+            detail = text
+        with self._lock:
+            run.update(kind=process.kind, detail=detail, pid=process.pid,
+                       pausable=bool(process.pausable),
+                       controllable=bool(process.controllable),
+                       tracking="unavailable" if getattr(process, "untracked", False) else "owned",
+                       _action=process, _starting=False)
+            cancelled = self._closed or run["_cancelled"]
+            run["state"] = "stopping" if cancelled else "running"
+            if not cancelled:
+                return {"op": "fire", "signal": target, "run": target,
+                        "temporary": temporary, "fired": True}
+
+        # Stop/close may arrive while the launcher is blocked. Never leave a
+        # child running merely because it appeared after that request returned.
+        try:
+            process.stop()
+        except (HintError, OSError) as error:
+            with self._lock:
+                # Keep a failed stop retryable instead of reporting "already
+                # stopping" forever for a child which is still running.
+                run["state"] = "running"
+            raise HintError(f"Could not stop cancelled run '{target}': {sanitize_error(error)}") from error
+        finally:
+            with self._lock:
+                self._refresh()
+        raise HintError(f"Run '{target}' was stopped while starting.")
 
     @staticmethod
     def _definitions() -> dict:
@@ -248,6 +312,16 @@ class RunManager:
             result = {"op": operation, "signal": name, "name": name, "count": 0,
                       "already": 0, "unsupported": 0, "failed": [], "active": len(selected)}
             for run in selected:
+                if run.get("_starting"):
+                    if operation != "stop":
+                        result["unsupported"] += 1
+                    elif run["_cancelled"]:
+                        result["already"] += 1
+                    else:
+                        run["_cancelled"] = True
+                        run["state"] = "stopping"
+                        result["count"] += 1
+                    continue
                 action = run["_action"]
                 if not run["controllable"] or (operation != "stop" and not run["pausable"]):
                     result["unsupported"] += 1
@@ -275,7 +349,7 @@ class RunManager:
             raise HintError("Invalid HINT control request.")
         operation = body["op"]
         allowed = {
-            "fire": {"op", "name", "action"},
+            "fire": {"op", "name", "action", "popup"},
             "pause": {"op", "name"}, "resume": {"op", "name"}, "stop": {"op", "name"},
             "status": {"op", "name"},
             "session": {"op", "environment"},
@@ -290,15 +364,17 @@ class RunManager:
         if operation == "fire":
             name = body.get("name")
             action = body.get("action")
+            popup = body.get("popup")
             if name is not None:
                 self._validate_target(name)
-                if action is not None:
-                    raise HintError("Supply either a saved name or --action.")
+                if action is not None or popup is not None:
+                    raise HintError("Supply either a saved name, --action or --popup.")
                 definitions = self._definitions()
                 if name not in definitions:
                     self._missing(name)
-                action = definitions[name]["action"]
-            return self.start(name, action)
+                action = definitions[name].get("action")
+                popup = definitions[name].get("popup")
+            return self.start(name, action, popup=popup)
         if operation == "session":
             environment = body.get("environment")
             if (not isinstance(environment, dict) or set(environment) - SESSION_VARIABLES
@@ -307,9 +383,8 @@ class RunManager:
             if not (environment.get("DISPLAY") or environment.get("WAYLAND_DISPLAY")):
                 raise HintError("No usable desktop session was supplied.")
             with self._lock:
-                # Session refresh and launching share a lock, so a new child
-                # receives one complete session environment. Existing children
-                # retain their original environment and are never restarted.
+                # Launches snapshot their environment under this lock before
+                # doing I/O. Existing children retain their original session.
                 for key in SESSION_VARIABLES - {"DBUS_SESSION_BUS_ADDRESS"}:
                     if key not in environment:
                         os.environ.pop(key, None)
@@ -351,6 +426,10 @@ class RunManager:
         with self._lock:
             self._closed = True
             for run in self._active:
+                if run.get("_starting"):
+                    run["_cancelled"] = True
+                    run["state"] = "stopping"
+                    continue
                 if run["controllable"]:
                     try:
                         run["_action"].stop()

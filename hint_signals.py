@@ -169,18 +169,20 @@ def validate(name: str, entry: object) -> None:
     validate_name(name)
     if _GENERATED_NAME.fullmatch(name):
         raise HintError(f"'{name}' is reserved for temporary runs. Choose another saved name.")
-    if not isinstance(entry, dict) or set(entry) - {"time", "wake", "action"}:
+    if not isinstance(entry, dict) or set(entry) - {"time", "wake", "action", "popup"}:
         raise HintError(f"invalid signal entry: {name}")
-    if not isinstance(entry.get("action"), str) or not entry["action"].strip():
-        raise HintError(f"signal {name!r} requires an action")
+    if ("action" in entry) == ("popup" in entry):
+        raise HintError(f"signal {name!r} requires exactly one of action or popup")
+    field = "popup" if "popup" in entry else "action"
+    label = "Popup text" if field == "popup" else "Action"
+    if not isinstance(entry[field], str) or not entry[field].strip():
+        raise HintError(label + " must be nonempty text.")
+    if "\0" in entry[field]:
+        raise HintError(label + " cannot contain a NUL character.")
     if "time" in entry:
         parse_time(entry["time"])
     if "wake" in entry and not isinstance(entry["wake"], bool):
         raise HintError(f"signal {name!r} wake must be a boolean")
-    if "\0" in entry["action"]:
-        raise HintError("Action cannot contain a NUL character.")
-    if entry["action"].lstrip().lower().startswith("popup:") and not entry["action"].split(":", 1)[1].strip():
-        raise HintError("Popup text cannot be empty.")
 
 
 def _next_wake(table: dict, now: datetime) -> datetime | None:
@@ -293,7 +295,8 @@ def fire(name: str, scheduled_time: str | None = None, launcher=None) -> dict:
         already_fired = key in _PENDING_CLEARS if key else False
         if not already_fired:
             try:
-                result = launcher(name, entry["action"])
+                result = (launcher(name, popup=entry["popup"]) if "popup" in entry
+                          else launcher(name, entry["action"]))
                 if isinstance(result, dict) and result.get("error"):
                     return result
             except (OSError, HintError) as exc:
@@ -341,7 +344,7 @@ def list_signals() -> dict:
 
 
 def set_signal(name: str, action: str | None = None, when: str | None = None,
-               wake: bool | None = None, no_time: bool = False) -> dict:
+               wake: bool | None = None, no_time: bool = False, *, popup: str | None = None) -> dict:
     """Change only supplied fields; clearing a schedule retains wake preference."""
     validate_name(name)
     if _GENERATED_NAME.fullmatch(name):
@@ -352,7 +355,9 @@ def set_signal(name: str, action: str | None = None, when: str | None = None,
         raise HintError("no_time must be a boolean")
     if when is not None and no_time:
         raise HintError("'--time' and '--no-time' cannot be used together.")
-    if action is None and when is None and wake is None and not no_time:
+    if action is not None and popup is not None:
+        raise HintError("Supply either --action or --popup.")
+    if action is None and popup is None and when is None and wake is None and not no_time:
         raise HintError(f"No changes supplied for '{name}'.")
     resolved_time = None
     if when is not None:
@@ -363,12 +368,16 @@ def set_signal(name: str, action: str | None = None, when: str | None = None,
     with locked():
         table = read_table()
         created = name not in table
-        if created and action is None:
-            raise HintError(f"Creating '{name}' requires --action.")
+        if created and action is None and popup is None:
+            raise HintError(f"Creating '{name}' requires --action or --popup.")
         previous = table.get(name, {})
         entry = dict(previous)
         if action is not None:
             entry["action"] = action
+            entry.pop("popup", None)
+        if popup is not None:
+            entry["popup"] = popup
+            entry.pop("action", None)
         if resolved_time is not None:
             entry["time"] = resolved_time
         if no_time:
@@ -378,7 +387,7 @@ def set_signal(name: str, action: str | None = None, when: str | None = None,
         elif wake is False:
             entry.pop("wake", None)
         validate(name, entry)
-        changed = [field for field in ("action", "time", "wake")
+        changed = [field for field in ("action", "popup", "time", "wake")
                    if previous.get(field, False if field == "wake" else None)
                    != entry.get(field, False if field == "wake" else None)]
         if created or changed:

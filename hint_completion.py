@@ -10,13 +10,13 @@ NAME = re.compile(r"^[A-Za-z0-9_-]+$")
 DEFINITION_OPTIONS = frozenset(("--set", "--fire", "--get", "--remove"))
 CONTROL_OPTIONS = frozenset(("--pause", "--resume", "--stop"))
 NAME_OPTIONS = DEFINITION_OPTIONS | CONTROL_OPTIONS | {"--status"}
-VALUE_OPTIONS = NAME_OPTIONS | {"--remote", "--time", "--action", "--server"}
+VALUE_OPTIONS = NAME_OPTIONS | {"--remote", "--time", "--action", "--popup", "--server"}
 OPTIONAL_VALUES = {"--fire", "--status"}
 OPERATIONS = NAME_OPTIONS | {"--list", "--discover", "--ready"}
 OPTIONS = (
     "--set", "--fire", "--pause", "--resume", "--stop", "--status",
     "--get", "--remove", "--list", "--discover", "--ready",
-    "--remote", "--action", "--time", "--no-time", "--wake", "--no-wake",
+    "--remote", "--action", "--popup", "--time", "--no-time", "--wake", "--no-wake",
     "--server", "--local", "--enable-wake", "--help"
 )
 COMPLETION_TIMEOUT = 1.6
@@ -117,6 +117,8 @@ def complete(words: list[str], cword: int) -> list[str]:
         from hint_network import discover
         candidates = discover(timeout=COMPLETION_TIMEOUT)
     elif pending in NAME_OPTIONS:
+        if pending == "--fire" and used & {"--action", "--popup"}:
+            return []
         if remote_present and (not remote or not NAME.fullmatch(remote)):
             return []
         if pending in CONTROL_OPTIONS or pending == "--status":
@@ -139,8 +141,8 @@ def complete(words: list[str], cword: int) -> list[str]:
         else:
             from hint_config import TABLE
             candidates = _names(_read_object(Path(TABLE)))
-        if pending == "--fire" and not prefix and not attached and "--action" not in used:
-            candidates.append("--action")
+        if pending == "--fire" and not prefix and not attached and not used & {"--action", "--popup"}:
+            candidates.extend(("--action", "--popup"))
         if pending == "--status" and not prefix and not attached and not remote_present:
             candidates.append("--remote")
     elif pending:
@@ -151,7 +153,7 @@ def complete(words: list[str], cword: int) -> list[str]:
         if "--set" not in used:
             forbidden = {"--time", "--no-time", "--wake", "--no-wake"}
             if "--fire" not in used or "--fire" in values:
-                forbidden.add("--action")
+                forbidden.update(("--action", "--popup"))
             candidates = [c for c in candidates if c not in forbidden]
         if used & OPERATIONS:
             candidates = [c for c in candidates if c not in OPERATIONS]
@@ -161,7 +163,8 @@ def complete(words: list[str], cword: int) -> list[str]:
             candidates = [c for c in candidates if c != "--remote"]
         if "--ready" not in used:
             candidates = [c for c in candidates if c not in {"--server", "--local", "--enable-wake"}]
-        for first, second in (("--time", "--no-time"), ("--wake", "--no-wake"), ("--server", "--local")):
+        for first, second in (("--time", "--no-time"), ("--wake", "--no-wake"), ("--server", "--local"),
+                              ("--action", "--popup")):
             if first in used:
                 candidates = [c for c in candidates if c != second]
             if second in used:

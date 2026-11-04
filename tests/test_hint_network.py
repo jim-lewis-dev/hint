@@ -122,7 +122,7 @@ class NetworkTests(unittest.TestCase):
     def test_partial_set_preflight_never_mutates_an_older_peer(self):
         with patch.object(hint, "config", return_value={"nats_server": "nats://localhost:4222"}), \
                 patch.object(network, "_run_client", return_value={"error": "unrecognized arguments: --status"}) as run:
-            result = network.remote("dirtsy", ["--set", "stretch", "--action", "popup:new"])
+            result = network.remote("dirtsy", ["--set", "stretch", "--popup", "new"])
             self.assertIn("does not support partial updates", result["error"])
             self.assertEqual(run.call_count, 1)
             self.assertEqual(run.call_args.kwargs["argv"], ["--status"])
@@ -132,11 +132,11 @@ class NetworkTests(unittest.TestCase):
         with patch.object(hint, "config", return_value={"nats_server": "nats://localhost:4222", "request_timeout_seconds": 3}), \
                 patch.object(network, "_run_client", side_effect=replies) as run, \
                 patch.object(network.time, "monotonic", side_effect=[10.0, 11.5]):
-            result = network.remote("dirtsy", ["--set", "stretch", "--action", "popup:new"])
+            result = network.remote("dirtsy", ["--set", "stretch", "--popup", "new"])
             self.assertEqual(result, {"op": "set"})
             self.assertEqual(run.call_args_list[0].kwargs["timeout"], 3)
             self.assertEqual(run.call_args_list[1].kwargs["timeout"], 1.5)
-            self.assertEqual(run.call_args_list[1].kwargs["argv"], ["--set", "stretch", "--action", "popup:new"])
+            self.assertEqual(run.call_args_list[1].kwargs["argv"], ["--set", "stretch", "--popup", "new"])
 
     def test_completion_budget_overrides_long_configured_discovery(self):
         envelope = subprocess.CompletedProcess([], 0, json.dumps({"ok": True, "value": ["hint_server_dirtsy"]}), "")
@@ -228,6 +228,12 @@ class LiveNetworkTests(unittest.TestCase):
         self.reply = {"error": "unknown signal: missing"}
         self.assertEqual(network.remote("test", ["--get", "missing"]), self.reply)
         self.assertEqual(self.received[-1], "hint --get missing")
+
+    def test_live_remote_popup_text_survives_transport_without_interpretation(self):
+        message = 'Dinner! "Now"\n$HOME; $(touch unexpected); --set'
+        self.reply = {"fired": True, "signal": "HINT-001"}
+        self.assertEqual(network.remote("test", ["--fire", "--popup", message]), self.reply)
+        self.assertEqual(shlex.split(self.received[-1]), ["hint", "--fire", "--popup", message])
 
     def test_live_hostname_with_internal_prefix_is_unambiguous(self):
         from agent_messenger import AgentMessenger

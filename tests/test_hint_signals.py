@@ -43,8 +43,8 @@ class SignalTests(unittest.TestCase):
         signals._PENDING_CLEARS.clear()
         signals._REPORTED_ERRORS.clear()
 
-    def launched(self, name, action):
-        return self.launch(action)
+    def launched(self, name, action=None, *, popup=None):
+        return self.launch(popup=popup) if popup is not None else self.launch(action)
 
     def fire(self, name, when=None):
         return signals.fire(name, when, launcher=self.launched)
@@ -261,15 +261,56 @@ class SignalTests(unittest.TestCase):
                     operation(name)
         self.rtc.assert_not_called()
 
-    def test_stored_signals_require_the_action_field(self):
+    def test_stored_signals_require_exactly_one_action_or_popup(self):
         self.table.parent.mkdir(parents=True)
         for entry in ({"handler": "/bin/true"},
-                      {"action": "/bin/true", "handler": "/bin/false"}):
+                      {"action": "/bin/true", "handler": "/bin/false"},
+                      {"action": "true", "popup": "hello"}, {}, {"popup": " "}):
             with self.subTest(entry=entry):
                 self.table.write_text(json.dumps({"bell": entry}))
                 with self.assertRaises(signals.HintError):
                     signals.read_table()
         self.rtc.assert_not_called()
+
+    def test_popup_definition_and_partial_updates_keep_one_content_field(self):
+        message = 'Dinner! "Now"\n$HOME; $(touch unexpected)'
+        created = signals.set_signal("dinner", popup=message, when="2030-01-01 07:01", wake=True)
+        self.assertTrue(created["created"])
+        self.assertEqual(created["definition"], {
+            "popup": message, "time": "2030-01-01 07:01:00", "wake": True
+        })
+        self.assertEqual(signals.get_signal("dinner"), {"dinner": created["definition"]})
+        self.assertEqual(signals.set_signal("dinner", popup=message)["changed"], [])
+        changed = signals.set_signal("dinner", action="printf hello")
+        self.assertNotIn("popup", changed["definition"])
+        self.assertEqual(changed["definition"]["action"], "printf hello")
+        self.assertEqual(changed["definition"]["time"], "2030-01-01 07:01:00")
+        self.assertTrue(changed["definition"]["wake"])
+        changed = signals.set_signal("dinner", popup="Now!")
+        self.assertNotIn("action", changed["definition"])
+        self.assertEqual(changed["definition"]["popup"], "Now!")
+        changed = signals.set_signal("dinner", no_time=True, wake=False)
+        self.assertEqual(changed["definition"], {"popup": "Now!"})
+
+    def test_scheduled_popup_launches_literal_text_and_can_be_rescheduled(self):
+        message = 'Dinner!\n$(touch unexpected)'
+        when = "2030-01-01 06:59:00"
+        signals.write_table({"dinner": {"popup": message, "time": when}})
+        signals.fire_due(launcher=self.launched)
+        self.launch.assert_called_once_with(popup=message)
+        self.assertEqual(signals.list_signals(), {"dinner": {"popup": message}})
+        signals.fire_due(launcher=self.launched)
+        self.assertEqual(self.launch.call_count, 1)
+        updated = signals.set_signal("dinner", when="2031")
+        self.assertEqual(updated["definition"], {"popup": message, "time": "2031-01-01 00:00:00"})
+
+    def test_manual_popup_fire_preserves_schedule_and_failed_launch_does_too(self):
+        signals.set_signal("dinner", popup="Dinner!", when="2030-01-01 07:01")
+        self.assertTrue(self.fire("dinner")["fired"])
+        self.launch.assert_called_once_with(popup="Dinner!")
+        self.launch.side_effect = signals.HintError("no usable desktop")
+        self.assertFalse(self.fire("dinner", "2030-01-01 07:01:00")["fired"])
+        self.assertEqual(signals.get_signal("dinner")["dinner"]["time"], "2030-01-01 07:01:00")
 
 
     def test_partial_set_keeps_unspecified_fields_and_clears_independently(self):
@@ -304,7 +345,8 @@ class SignalTests(unittest.TestCase):
         signals.set_signal("bell", "action")
         original = self.table.read_bytes()
         cases = [
-            {"action": ""}, {"action": "popup:  "}, {"action": "bad\0action"},
+            {"action": ""}, {"popup": " "}, {"action": "bad\0action"},
+            {"popup": "bad\0text"}, {"action": "true", "popup": "hello"},
             {"when": "2030-01-01 07:01", "no_time": True}, {"wake": 1},
             {"when": "2029"}, {}
         ]

@@ -155,6 +155,84 @@ class InstallTests(unittest.TestCase):
         self.assertLess(pip_index, gate_index)
         self.assertLess(gate_index, stop_index)
 
+    def test_fresh_install_prompts_once_and_keeps_selected_server(self):
+        server = 'nats://broker.example:4333'
+        with patch('hint_ready.sys.stdin.isatty', return_value=True), \
+                patch('builtins.input', return_value=server) as prompt:
+            self.install(local=False)
+        prompt.assert_called_once()
+        self.assertEqual(json.loads(self.paths.config.read_text())['nats_server'], server)
+
+    def test_fresh_install_prompts_once_for_local_mode(self):
+        with patch('hint_ready.sys.stdin.isatty', return_value=True), \
+                patch('builtins.input', return_value='local') as prompt:
+            self.install(local=False)
+        prompt.assert_called_once()
+        self.assertIsNone(json.loads(self.paths.config.read_text())['nats_server'])
+
+    def test_explicit_server_does_not_prompt(self):
+        server = 'nats://broker.example:4333'
+        with patch('builtins.input', side_effect=AssertionError('unexpected prompt')):
+            self.install(local=False, server=server)
+        self.assertEqual(json.loads(self.paths.config.read_text())['nats_server'], server)
+
+    def test_explicit_local_does_not_prompt(self):
+        with patch('builtins.input', side_effect=AssertionError('unexpected prompt')):
+            self.install(local=True)
+        self.assertIsNone(json.loads(self.paths.config.read_text())['nats_server'])
+
+    def test_configuration_created_during_install_is_not_silently_substituted(self):
+        changed = b'{"nats_server":"nats://other.example:4222"}\n'
+
+        def run_tool(argv, **kwargs):
+            result = self.run_tool(argv, **kwargs)
+            if [str(value) for value in argv[1:4]] == ['-m', 'pip', 'install']:
+                self.paths.config.parent.mkdir(parents=True)
+                self.paths.config.write_bytes(changed)
+            return result
+
+        with patch('hint_ready.sys.stdin.isatty', return_value=True), \
+                patch('builtins.input', return_value='nats://chosen.example:4222') as prompt, \
+                patch('hint_ready._run', side_effect=run_tool), \
+                self.assertRaisesRegex(ReadyError, 'settings changed during installation'):
+            self.install(local=False)
+        prompt.assert_called_once()
+        self.assertEqual(self.paths.config.read_bytes(), changed)
+        self.assertFalse(self.paths.environment.exists())
+        self.assertNotIn(['systemctl', '--user', 'restart', 'hint.service'], self.calls)
+
+    def test_revalidation_keeps_signal_changes_during_preparation(self):
+        self.install()
+        changed = b'{"later":{"action":"/bin/true"}}\n'
+
+        def run_tool(argv, **kwargs):
+            result = self.run_tool(argv, **kwargs)
+            if [str(value) for value in argv[1:4]] == ['-m', 'pip', 'install']:
+                self.paths.signals.write_bytes(changed)
+            return result
+
+        with patch('builtins.input', side_effect=AssertionError('unexpected prompt')), \
+                patch('hint_ready._run', side_effect=run_tool):
+            self.install()
+        self.assertEqual(self.paths.signals.read_bytes(), changed)
+
+    def test_invalid_signal_change_during_preparation_aborts_before_service_stop(self):
+        self.install()
+        old = self.paths.environment.resolve()
+        self.calls.clear()
+
+        def run_tool(argv, **kwargs):
+            result = self.run_tool(argv, **kwargs)
+            if [str(value) for value in argv[1:4]] == ['-m', 'pip', 'install']:
+                self.paths.signals.write_text('[]\n')
+            return result
+
+        with patch('hint_ready._run', side_effect=run_tool), \
+                self.assertRaisesRegex(ReadyError, 'signals.json must contain a JSON object'):
+            self.install()
+        self.assertEqual(self.paths.environment.resolve(), old)
+        self.assertNotIn(['systemctl', '--user', 'stop', 'hint.service'], self.calls)
+
     def test_failed_preparation_never_stops_or_changes_working_installation(self):
         self.install()
         old = self.paths.environment.resolve()

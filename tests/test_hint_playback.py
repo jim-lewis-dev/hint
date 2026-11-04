@@ -1,5 +1,6 @@
 """Owned action lifecycle and media/display dispatch without personal applications."""
 import json
+import errno
 import os
 from pathlib import Path
 import shlex
@@ -122,21 +123,31 @@ class PlaybackTests(unittest.TestCase):
             document.assert_called_once()
 
     def test_empty_nul_and_empty_popup_are_rejected(self):
-        for action in ("", " ", "a\0b", "POPUP:", " popup:  "):
+        for action in ("", " ", "a\0b"):
             with self.subTest(action=action), self.assertRaises(HintError):
                 playback.launch(action)
+        for message in ("", " ", "a\0b", 3):
+            with self.subTest(popup=message), self.assertRaises(HintError):
+                playback.launch(popup=message)
+        with self.assertRaises(HintError):
+            playback.launch("true", popup="hello")
 
-    def test_popup_case_insensitive_prefix_keeps_text_literal(self):
-        message = ' $HOME <b>hello</b>: $(touch unexpected) '
-        for prefix in ("popup:", "POPUP:", "Popup:"):
-            with self.subTest(prefix=prefix), patch.object(playback, "_popup", return_value="popup") as popup:
-                self.assertEqual(playback.launch("  " + prefix + message), "popup")
-                popup.assert_called_once_with(message)
+    def test_popup_option_keeps_all_text_literal(self):
+        message = ' $HOME <b>hello!</b>: "yes"\n$(touch unexpected) '
+        with patch.object(playback, "_popup", return_value="popup") as popup:
+            self.assertEqual(playback.launch(popup=message), "popup")
+            popup.assert_called_once_with(message)
         self.assertFalse((self.home / "unexpected").exists())
+
+    def test_old_popup_prefix_is_an_ordinary_shell_command(self):
+        with patch.object(playback, "_popup", side_effect=AssertionError("popup opened")), \
+                patch.object(playback, "_spawn", return_value="command") as spawn:
+            self.assertEqual(playback.launch("POPUP:hello"), "command")
+            spawn.assert_called_once_with([playback.SHELL, "-c", "POPUP:hello"], detail="POPUP:hello")
 
     def test_popup_uses_distro_python_and_its_own_module(self):
         with patch.dict(os.environ, {"DISPLAY": ":99"}), patch.object(playback, "_spawn", return_value="window") as spawn:
-            self.assertEqual(playback.launch("popup:--help"), "window")
+            self.assertEqual(playback.launch(popup="--help"), "window")
             argv = spawn.call_args.args[0]
             self.assertEqual(argv[0], "/usr/bin/python3")
             self.assertTrue(argv[1].endswith("hint_popup.py"))
@@ -146,7 +157,7 @@ class PlaybackTests(unittest.TestCase):
     def test_visual_action_without_desktop_fails_before_spawn(self):
         with patch.dict(os.environ, {"DISPLAY": "", "WAYLAND_DISPLAY": ""}), patch.object(playback, "_spawn") as spawn:
             with self.assertRaisesRegex(HintError, "no usable desktop"):
-                playback.launch("popup:hello")
+                playback.launch(popup="hello")
             with self.assertRaisesRegex(HintError, "no usable desktop"):
                 playback.launch("https://example.com")
             spawn.assert_not_called()
@@ -204,6 +215,136 @@ class PlaybackTests(unittest.TestCase):
                 self.assertIn(expected, play.call_args.args)
                 self.assertEqual(play.call_args.kwargs["kind"], kind)
                 self.assertEqual(play.call_args.kwargs.get("pausable", True), pausable)
+
+    def test_media_keeps_symlink_path_without_resolving_it(self):
+        target = self.root / "mounted share" / "song.mp3"
+        target.parent.mkdir()
+        target.touch()
+        alias = self.root / "song.mp3"
+        alias.symlink_to(target)
+        with patch.object(Path, "resolve", side_effect=OSError(errno.EINVAL, "Invalid argument")):
+            inspected = playback._inspect_path(alias)
+        self.assertEqual(inspected["mime"], "audio/mpeg")
+        with patch.object(playback, "_play", return_value="player") as play:
+            self.assertEqual(playback.launch(str(alias)), "player")
+        self.assertEqual(play.call_args.args[-1], str(alias))
+
+    def test_extensionless_symlink_inherits_target_media_type(self):
+        target = self.root / "song.mp3"
+        target.touch()
+        alias = self.root / "song"
+        alias.symlink_to(target)
+        with patch.object(playback, "_play", return_value="player") as play:
+            self.assertEqual(playback.launch(str(alias)), "player")
+        self.assertEqual(play.call_args.kwargs["kind"], "audio")
+        self.assertEqual(play.call_args.args[-1], str(alias))
+
+    def test_parent_traversal_through_symlink_preserves_filesystem_meaning(self):
+        mounted = self.root / "mount" / "folder"
+        mounted.mkdir(parents=True)
+        (mounted.parent / "song.mp3").touch()
+        alias = self.root / "alias"
+        alias.symlink_to(mounted, target_is_directory=True)
+        path = alias / ".." / "song.mp3"
+        with patch.object(playback, "_play", return_value="player") as play:
+            self.assertEqual(playback.launch(str(path)), "player")
+        self.assertEqual(play.call_args.args[-1], str(path))
+
+    def test_command_ending_in_media_extension_still_runs_as_command(self):
+        run = self.launch("printf booyah > result.mp3")
+        self.assertTrue(eventually(lambda: run.poll() is not None))
+        self.assertEqual((self.home / "result.mp3").read_text(), "booyah")
+
+    def test_stalled_share_probe_is_killed_and_never_launches_later(self):
+        worker = self.root / "blocked_probe.py"
+        marker, late = self.root / "probe-pid", self.root / "too-late"
+        worker.write_text(
+            "import os,pathlib,time\n"
+            f"pathlib.Path({str(marker)!r}).write_text(str(os.getpid()))\n"
+            "time.sleep(20)\n"
+            f"pathlib.Path({str(late)!r}).touch()\n"
+        )
+        started = time.monotonic()
+        with patch.object(playback, "__file__", str(worker)), \
+                patch.object(playback, "PATH_PROBE_SECONDS", 0.3), \
+                patch.object(playback, "_spawn") as spawn:
+            with self.assertRaisesRegex(HintError, "network share; nothing was launched"):
+                playback.launch(str(self.root / "mounted-song.mp3"))
+            spawn.assert_not_called()
+        self.assertLess(time.monotonic() - started, 2)
+        self.assertTrue(marker.exists(), "the isolated probe must actually have started")
+        pid = int(marker.read_text())
+
+        def reaped():
+            try:
+                os.kill(pid, 0)
+                return False
+            except ProcessLookupError:
+                return True
+
+        self.assertTrue(eventually(reaped))
+        self.assertFalse(late.exists())
+        run = self.launch("printf recovered > recovered")
+        self.assertTrue(eventually(lambda: run.poll() is not None))
+        self.assertEqual((self.home / "recovered").read_text(), "recovered")
+
+    def test_path_error_is_reported_without_poisoning_the_next_launch(self):
+        worker = self.root / "failed_probe.py"
+        worker.write_text(
+            "import json\n"
+            "print(json.dumps({'kind':'error','message':'[Errno 22] Invalid argument'}))\n"
+        )
+        with patch.object(playback, "__file__", str(worker)), patch.object(playback, "_spawn") as spawn:
+            with self.assertRaisesRegex(HintError, r"Cannot inspect .*Errno 22"):
+                playback.launch(str(self.root / "song.mp3"))
+            spawn.assert_not_called()
+        path = self.root / "song.mp3"
+        path.touch()
+        with patch.object(playback, "_play", return_value="player"):
+            self.assertEqual(playback.launch(str(path)), "player")
+
+    def test_repeated_file_launches_have_independent_player_controls(self):
+        path = self.root / "song.mp3"
+        path.touch()
+        with patch.object(playback, "_spawn", return_value="player") as spawn:
+            playback.launch(str(path))
+            playback.launch(str(path))
+        self.assertEqual(spawn.call_count, 2)
+        first, second = spawn.call_args_list
+        for call in (first, second):
+            self.addCleanup(playback.shutil.rmtree, call.kwargs["temporary"], True)
+            self.assertEqual(call.args[0][-1], str(path))
+        self.assertNotEqual(first.kwargs["ipc"], second.kwargs["ipc"])
+
+    def test_launch_uses_its_session_snapshot(self):
+        environment = dict(os.environ, DISPLAY=":22")
+        run = playback.launch('printf "%s" "$DISPLAY" > display', environment=environment)
+        self.addCleanup(run.stop)
+        self.assertTrue(eventually(lambda: run.poll() is not None))
+        self.assertEqual((self.home / "display").read_text(), ":22")
+        environment["DISPLAY"] = ""
+        environment["WAYLAND_DISPLAY"] = ""
+        with self.assertRaisesRegex(HintError, "no usable desktop"):
+            playback.launch(popup="hello", environment=environment)
+
+    def test_cancelled_launch_starts_no_child_and_cleans_player_resources(self):
+        path = self.root / "song.mp3"
+        path.touch()
+        cancelled = threading.Event()
+        original = playback._temporary
+        temporary = []
+
+        def cancel_before_spawn(*args, **kwargs):
+            directory = original(*args, **kwargs)
+            temporary.append(directory)
+            cancelled.set()
+            return directory
+
+        with patch.object(playback, "_temporary", side_effect=cancel_before_spawn):
+            with self.assertRaisesRegex(HintError, "launch was cancelled"):
+                playback.launch(str(path), cancelled=cancelled.is_set)
+        self.assertEqual(len(temporary), 1)
+        self.assertFalse(temporary[0].exists())
 
     def test_browser_uses_independent_profile_and_fullscreen(self):
         with patch.dict(os.environ, {"DISPLAY": ":99"}), \
@@ -327,6 +468,21 @@ class PlaybackTests(unittest.TestCase):
             self.assertEqual(argv[-1], str(path))
             fullscreen.assert_called_once_with("office")
             __import__("shutil").rmtree(spawn.call_args.kwargs["temporary"])
+
+    def test_extensionless_office_symlink_uses_isolated_libreoffice(self):
+        target = self.root / "sheet.xlsx"
+        target.touch()
+        alias = self.root / "sheet"
+        alias.symlink_to(target)
+        with patch.object(playback.shutil, "which", return_value="/usr/bin/libreoffice"), \
+                patch.object(playback, "_spawn", return_value="office") as spawn, \
+                patch.object(playback, "_fullscreen_owned"):
+            self.assertEqual(playback.launch(str(alias)), "office")
+        self.addCleanup(playback.shutil.rmtree, spawn.call_args.kwargs["temporary"], True)
+        argv = spawn.call_args.args[0]
+        self.assertEqual(argv[0], "/usr/bin/libreoffice")
+        self.assertTrue(any(arg.startswith("-env:UserInstallation=file:") for arg in argv))
+        self.assertEqual(argv[-1], str(alias))
 
     def test_missing_player_cleans_private_socket_directory(self):
         path = self.root / "song.mp3"
